@@ -15,3 +15,39 @@ ls -lh ft_models/finetuned_nemotron_candidate.nemo ft_models/finetuned_nemotron_
 python3 -m json.tool results/safe_training/deployment_gate.json
 python3 -c 'import json; r=json.load(open("results/safe_training/deployment_gate.json")); print("DEPLOYMENT PASSED" if r["passed"] else "DEPLOYMENT FAILED"); print(json.dumps(r,indent=2))'
 us-central1-docker.pkg.dev/emr-dgt-autonomous-uctr1-snbx/asr-nemotron-3
+
+for calls longer than two
+minutes i am getting this 
+urrently in transit you should receive it within three to five business days.  (TTFB 559ms)
+[final]  Okay, but it is already been about a week, and I still have not received it, so I am a bit concerned.  (TTFB 746ms)
+[partial] Yet I understand your concern sometimes there can be delays due
+[receive error] no close frame received or sent
+[final]  Yet I understand your concern sometimes there can be delays due
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\nemotron_finetuned\client.py", line 305, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\re_nikitav\Documents\nemotron_finetuned\client.py", line 299, in main
+    asyncio.run(run_mic(args.language, args.url))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Documents\nemotron_finetuned\client.py", line 239, in run_mic
+    await ws.send(pcm)
+  File "C:\Users\re_nikitav\Desktop\asr\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\asyncio\connection.py", line 485, in send
+    async with self.send_context():
+               ~~~~~~~~~~~~~~~~~^^
+  File "C:\Program Files\Python313\Lib\contextlib.py", line 214, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Desktop\asr\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\asyncio\connection.py", line 965, in send_context
+    raise self.protocol.close_exc from original_exc
+websockets.exceptions.ConnectionClosedError: no close frame received or sent
+why ?
