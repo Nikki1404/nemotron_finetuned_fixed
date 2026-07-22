@@ -1,14 +1,7 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# ---- Optional proxy support ----
-# On a normal EC2 host, leave these empty. On a corporate network, pass:
-#   --build-arg HTTP_PROXY=http://host:port --build-arg HTTPS_PROXY=http://host:port
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
-ENV http_proxy=${HTTP_PROXY}
-ENV https_proxy=${HTTPS_PROXY}
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
+ENV http_proxy="http://163.116.128.80:8080"
+ENV https_proxy="http://163.116.128.80:8080"
 
 ENV PYTHONUNBUFFERED=1
 ENV PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org pypi.python.org"
