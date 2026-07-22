@@ -14,3 +14,4 @@ docker rm -f nemotron-trainer 2>/dev/null || true; docker run --rm --name nemotr
 ls -lh ft_models/finetuned_nemotron_candidate.nemo ft_models/finetuned_nemotron_final.nemo
 python3 -m json.tool results/safe_training/deployment_gate.json
 python3 -c 'import json; r=json.load(open("results/safe_training/deployment_gate.json")); print("DEPLOYMENT PASSED" if r["passed"] else "DEPLOYMENT FAILED"); print(json.dumps(r,indent=2))'
+us-central1-docker.pkg.dev/emr-dgt-autonomous-uctr1-snbx/asr-nemotron-3
