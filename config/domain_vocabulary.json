@@ -1,0 +1,51 @@
+{
+  "entities": [
+    {
+      "canonical": "Inspira Financial",
+      "variants": [
+        "Inspire Financial",
+        "Inspirer Financial",
+        "In Spira Financial",
+        "Inspira Finanacial",
+        "Inspira Financal"
+      ],
+      "required_context": [
+        "calling",
+        "thank you for",
+        "welcome to",
+        "member id",
+        "social security",
+        "debit card",
+        "account"
+      ]
+    },
+    {
+      "canonical": "Inspira debit card",
+      "variants": [
+        "Inspire debit card",
+        "Inspirer debit card"
+      ]
+    },
+    {
+      "canonical": "support ticket",
+      "variants": [
+        "support picket"
+      ],
+      "required_context": [
+        "create a",
+        "ticket number",
+        "ticket num"
+      ]
+    },
+    {
+      "canonical": "not valid",
+      "variants": [
+        "not dalid"
+      ],
+      "required_context": [
+        "error",
+        "technical issue"
+      ]
+    }
+  ]
+}
