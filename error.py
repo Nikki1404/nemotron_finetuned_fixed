@@ -7,48 +7,10 @@ mkdir -p ft_models logs results/safe_training data/manifests data/audio_16k data
 docker rm -f nemotron-trainer 2>/dev/null || true; docker run --rm --name nemotron-trainer --gpus all --ipc=host -e PYTHONPATH=/workspace -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e TOKENIZERS_PARALLELISM=false -v "$PWD:/workspace" -v "$PWD/ft_models:/srv/models" -w /workspace nemotron_finetuned_3.5 bash -lc 'set -o pipefail; bash scripts/run_safe_finetuning.sh 2>&1 | tee logs/safe_finetuning.log'
 tail -f logs/safe_finetuning.log
 
-docker rm -f nemotron-trainer 2>/dev/null || true; docker run --rm --name nemotron-trainer --gpus all --ipc=host -e PYTHONPATH=/workspace -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e TOKENIZERS_PARALLELISM=false -e NUMBA_CACHE_DIR=/tmp/numba_cache -v "$PWD:/workspace" -v "$PWD/ft_models:/srv/models" -w /workspace nemotron_finetuned_3.5 bash -lc 'set -euo pipefail; apt-get update; apt-get install -y --no-install-recommends cuda-nvvm-12-4; rm -rf /var/lib/apt/lists/*; python3.11 -m pip uninstall -y numba-cuda numba llvmlite || true; python3.11 -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" "llvmlite==0.43.0" "numba==0.60.0"; rm -rf /root/.cache/numba /tmp/numba_cache; export CUDA_HOME=/usr/local/cuda; NVVM="$(find /usr/local -path "*/nvvm/lib64/libnvvm.so" -print -quit)"; test -n "$NVVM" || { echo "ERROR: libnvvm.so missing"; exit 1; }; export LD_LIBRARY_PATH="$(dirname "$NVVM"):/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"; python3.11 -c "import ctypes,numba,llvmlite,numpy; from numba import cuda; ctypes.CDLL(\"$NVVM\"); print(\"NumPy:\",numpy.__version__); print(\"Numba:\",numba.__version__); print(\"llvmlite:\",llvmlite.__version__); print(\"Numba CUDA:\",cuda.__file__); print(\"CUDA available:\",cuda.is_available()); print(\"libNVVM:\",\"$NVVM\")"; set -o pipefail; bash scripts/run_safe_finetuning.sh 2>&1 | tee logs/safe_finetuning.log'
-
-getting this 
-                                                                      [NeMo I 2026-07-22 03:13:00 wer:318]
-    dation DataLoader 0:  71%|███████▏  | 5/7 [00:02<00:01,  1.77it/s]
-[NeMo I 2026-07-22 03:13:00 wer:319] WER reference:ending in forty six seventy eight please check your messages and try again okay i will check is there anything else i can help you with
-[NeMo I 2026-07-22 03:13:00 wer:320] WER predicted:Ending in forty six seventy eight, please check your messages and try again. <en-US> Okay, I will check. <en-US> Is there anything else I can help you with
-                                                                      [NeMo I 2026-07-22 03:13:00 wer:318]
-    dation DataLoader 0:  86%|████████▌ | 6/7 [00:02<00:00,  2.03it/s]
-[NeMo I 2026-07-22 03:13:00 wer:319] WER reference:no thanks thank you for calling inspira financial have a nice day
-[NeMo I 2026-07-22 03:13:00 wer:320] WER predicted:No thanks. <en-US> Thank you for calling Inspira Financial. <en-US> Have a nice day. <en-US>
-                                                                      [NeMo I 2026-07-22 03:13:00 asr_model:198] CUDA graphs disabled for EncDecRNNTBPEModelWithPrompt::RNNTBPEDecoding::GreedyBatchedRNNTInfer███| 7/7 [00:03<00:00,  2.26it/s]
-Epoch 0: 100%|██████████| 260/260 [01:25<00:00,  3.06it/s, v_num=2][NeMo I 2026-07-22 03:13:00 asr_model:185] CUDA graphs enabled for EncDecRNNTBPEModelWithPrompt::RNNTBPEDecoding::GreedyBatchedRNNTInfer
-Traceback (most recent call last):
-  File "/workspace/scripts/finetune_nemotron.py", line 250, in <module>
-    main()
-  File "/workspace/scripts/finetune_nemotron.py", line 213, in main
-    trainer.fit(model)
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 538, in fit
-    call._call_and_handle_interrupt(
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 47, in _call_and_handle_interrupt
-    return trainer_fn(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 574, in _fit_impl
-    self._run(model, ckpt_path=ckpt_path)
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 981, in _run
-    results = self._run_stage()
-              ^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1025, in _run_stage
-    self.fit_loop.run()
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 206, in run
-    self.on_advance_end()
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 378, in on_advance_end
-    call._call_callback_hooks(trainer, "on_train_epoch_end", monitoring_callbacks=True)
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 218, in _call_callback_hooks
-    fn(trainer, trainer.lightning_module, *args, **kwargs)
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/callbacks/early_stopping.py", line 190, in on_train_epoch_end
-    self._run_early_stopping_check(trainer)
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/callbacks/early_stopping.py", line 202, in _run_early_stopping_check
-    if trainer.fast_dev_run or not self._validate_condition_metric(  # disable early_stopping with fast_dev_run
-                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.11/site-packages/lightning/pytorch/callbacks/early_stopping.py", line 153, in _validate_condition_metric
-    raise RuntimeError(error_msg)
-RuntimeError: Early stopping conditioned on metric `val_loss` which is not available. Pass in or modify your `EarlyStopping` callback to use any of the following: `train_loss`, `learning_rate`, `global_step`, `training_batch_wer`, `val_wer`
-Epoch 0: 100%|██████████| 260/260 [01:26<00:00,  3.00it/s, v_num=2]
+python3 -c 'from pathlib import Path; p=Path("scripts/finetune_nemotron.py"); s=p.read_text(); s=s.replace("filename=\"best-{epoch:02d}-{val_loss:.4f}\"","filename=\"best-{epoch:02d}-{val_wer:.4f}\""); s=s.replace("monitor=\"val_loss\"","monitor=\"val_wer\""); s=s.replace("\"best_val_loss\": float(checkpoint.best_model_score)","\"best_val_wer\": float(checkpoint.best_model_score)"); s=s.replace("verbose=True,\n    )","verbose=True,\n        check_on_train_epoch_end=False,\n    )"); p.write_text(s); print("Changed checkpoint and early stopping metric to val_wer")'
+grep -nE 'filename=|monitor=|best_val_|check_on_train' scripts/finetune_nemotron.py
+grep -n 'val_loss' scripts/finetune_nemotron.py || echo "No val_loss callback references remain"
+docker rm -f nemotron-trainer 2>/dev/null || true; docker run --rm --name nemotron-trainer --gpus all --ipc=host -e PYTHONPATH=/workspace -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e TOKENIZERS_PARALLELISM=false -e NUMBA_CACHE_DIR=/tmp/numba_cache -v "$PWD:/workspace" -v "$PWD/ft_models:/srv/models" -w /workspace nemotron_finetuned_3.5 bash -lc 'set -euo pipefail; apt-get update; apt-get install -y --no-install-recommends cuda-nvvm-12-4; rm -rf /var/lib/apt/lists/*; python3.11 -m pip uninstall -y numba-cuda numba llvmlite >/dev/null 2>&1 || true; python3.11 -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" "llvmlite==0.43.0" "numba==0.60.0"; rm -rf /root/.cache/numba /tmp/numba_cache /srv/models/finetuned_nemotron_candidate_checkpoints; export CUDA_HOME=/usr/local/cuda; NVVM="$(find /usr/local -path "*/nvvm/lib64/libnvvm.so" -print -quit)"; test -n "$NVVM" || { echo "ERROR: libnvvm.so missing"; exit 1; }; export LD_LIBRARY_PATH="$(dirname "$NVVM"):/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"; python3.11 -c "import ctypes,numba,llvmlite,numpy; from numba import cuda; ctypes.CDLL(\"$NVVM\"); print(\"NumPy:\",numpy.__version__); print(\"Numba:\",numba.__version__); print(\"llvmlite:\",llvmlite.__version__); print(\"CUDA available:\",cuda.is_available()); print(\"libNVVM:\",\"$NVVM\")"; echo "===== FINE-TUNING ====="; python3.11 scripts/finetune_nemotron.py --train-manifest data/manifests/train_aligned_aug_manifest.json --val-manifest data/manifests/val_aligned_manifest.json --base-model /srv/nemotron-3.5-asr-streaming-0.6b.nemo --output-nemo /srv/models/finetuned_nemotron_candidate.nemo --freeze-mode decoder_only --max-epochs 4 --batch-size 1 --accumulate-grad-batches 8 --lr 1e-6 --language en-US --precision bf16-mixed --num-workers 0 --max-duration 20 --patience 2 --seed 42 2>&1 | tee logs/retry_finetuning.log; echo "===== CANDIDATE EVALUATION ====="; python3.11 scripts/evaluate_manifest.py --model /srv/models/finetuned_nemotron_candidate.nemo --manifest data/manifests/test_aligned_manifest.json --language en-US --output-jsonl results/safe_training/finetuned_test.jsonl; echo "===== DEPLOYMENT GATE ====="; python3.11 scripts/evaluation_gate.py --base results/safe_training/base_test.jsonl --candidate results/safe_training/finetuned_test.jsonl --entity inspira --max-raw-regression 2.0 --max-semantic-regression 0.5 --report results/safe_training/deployment_gate.json; echo "===== PROMOTING MODEL ====="; cp /srv/models/finetuned_nemotron_candidate.nemo /srv/models/finetuned_nemotron_final.nemo; cp /srv/models/finetuned_nemotron_candidate.training_summary.json /srv/models/finetuned_nemotron_final.training_summary.json; ls -lh /srv/models/finetuned_nemotron_final.nemo; echo "FINE-TUNING AND EVALUATION COMPLETED"'
+ls -lh ft_models/finetuned_nemotron_candidate.nemo ft_models/finetuned_nemotron_final.nemo
+python3 -m json.tool results/safe_training/deployment_gate.json
+python3 -c 'import json; r=json.load(open("results/safe_training/deployment_gate.json")); print("DEPLOYMENT PASSED" if r["passed"] else "DEPLOYMENT FAILED"); print(json.dumps(r,indent=2))'
