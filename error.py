@@ -16,6 +16,22 @@ python3 -m json.tool results/safe_training/deployment_gate.json
 python3 -c 'import json; r=json.load(open("results/safe_training/deployment_gate.json")); print("DEPLOYMENT PASSED" if r["passed"] else "DEPLOYMENT FAILED"); print(json.dumps(r,indent=2))'
 us-central1-docker.pkg.dev/emr-dgt-autonomous-uctr1-snbx/asr-nemotron-3
 
+docker build -t nemotron_finetuned .
+docker run -d \
+  --name nemotron-base \
+  --restart unless-stopped \
+  --gpus all \
+  --ipc=host \
+  -p 8002:8002 \
+  -v "$PWD/audio_logs/base:/srv/audio_logs" \
+  -e MODEL_NAME=/srv/nemotron-3.5-asr-streaming-0.6b.nemo \
+  -e ENABLE_POSTPROCESSING=false \
+  nemotron_finetuned \
+  uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8002 \
+    --ws-ping-interval 20 \
+    --ws-ping-timeout 120
 #!/usr/bin/env python3
 
 import argparse
