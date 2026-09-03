@@ -779,3 +779,82 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+(venv) PS C:\Users\re_nikitav\Documents\asr\nemotron_finetuned> python C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py --folder C:\Users\re_nikitav\Downloads\recordings\recording_wav --language en-US
+[info] Server health: {'status': 'ok', 'engines': ['nemotron'], 'device': 'cuda', 'sample_rate': 16000, 'audio_log_dir': '/srv/audio_logs'}
+[info] Found 9 WAV file(s) in C:\Users\re_nikitav\Downloads\recordings\recording_wav
+[info] Each transcript will be saved beside its WAV as <filename>.txt
+
+
+========================================================================
+[info] [1/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
+========================================================================
+[info] File: call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
+[info] Audio: 48000Hz 2ch 16bit 145.2s
+[info] Language: en-US
+[info] Realtime simulation: False
+[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+
+[info] Resampling audio from 48000Hz → 16000Hz
+[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish  [partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank    [info] File sent — sending EOF and waiting for final results...
+[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I would like to update my phone number on my account. I can help you    [info] [session 1] timed out waiting for flush
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 745, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 720, in main
+    asyncio.run(
+    ~~~~~~~~~~~^
+        run_folder(
+        ^^^^^^^^^^^
+    ...<7 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 432, in run_folder
+    transcript = await run_file(
+                 ^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 351, in run_file
+    await stream_forever(
+    ...<7 lines>...
+    )
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 248, in stream_forever
+    input_finished = await _run_one_leg(
+                     ^^^^^^^^^^^^^^^^^^^
+        url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 227, in _run_one_leg
+    await recv_task
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 114, in _receive_loop
+    async for raw in ws:
+    ...<29 lines>...
+            print(f"\n[server error] {text}")
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\connection.py", line 236, in __aiter__
+    yield await self.recv()
+          ^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\connection.py", line 297, in recv
+    return await self.recv_messages.get(decode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\messages.py", line 158, in get
+    frame = await self.frames.get(not self.closed)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\messages.py", line 51, in get
+    await self.get_waiter
+asyncio.exceptions.CancelledError
