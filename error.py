@@ -802,3 +802,80 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+(venv) PS C:\Users\re_nikitav\Documents\asr\nemotron_finetuned> python C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py --folder C:\Users\re_nikitav\Downloads\recordings\recording_wav --language en-US --eof-wait 240
+[info] Server health: {'status': 'ok', 'engines': ['nemotron'], 'device': 'cuda', 'sample_rate': 16000, 'audio_log_dir': '/srv/audio_logs'}
+[info] Found 9 WAV file(s) in C:\Users\re_nikitav\Downloads\recordings\recording_wav
+[info] Each transcript will be saved beside its WAV as <filename>.txt
+
+
+========================================================================
+[info] [1/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
+========================================================================
+[info] File: call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
+[info] Audio: 48000Hz 2ch 16bit 145.2s
+[info] Language: en-US
+[info] Realtime simulation: False
+[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+
+[info] Resampling audio from 48000Hz → 16000Hz
+[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English    [info] File sent — sending EOF and waiting for final results...
+[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update m[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update m[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update my phone number on my account. I    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
+[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.txt
+[info]
+Done. Audio=145.2s Wall=50.51s RTF=0.35x
+
+========================================================================
+[info] [2/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.wav
+========================================================================
+[info] File: call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.wav
+[info] Audio: 48000Hz 2ch 16bit 133.8s
+[info] Language: en-US
+[info] Realtime simulation: False
+[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+
+[info] Resampling audio from 48000Hz → 16000Hz
+[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+[final]  Well, thank you for calling Inspira Financial for this call. Would you prefer to continue in English or Spanish language  (TTFB 844ms)
+[final]  I.
+[final]  Thank you.  (TTFB 616ms)
+[final]  Your language preference for this call all is set to English. How can I help you today  (TTFB 375ms)
+[info] File sent — sending EOF and waiting for final results...
+[final]  I am calling you because I have not received the verification code on my mobile.  (TTFB 893ms)
+[final]  I understand how frustrating it can be when you're waiting for a code that doesn't arrive. I can help you with that.  (TTFB 591ms)
+[final]  To get started, I'll need to verify your identity.  (TTFB 363ms)
+[final]  Can you please provide your four digit member ID and last four digits of your social security number  (TTFB 301ms)
+[final]  It's two zero four three and one two two three four  (TTFB 815ms)
+[partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset that for you right now. Thought let me reset the alert so you can receive the code. I'm sorry you    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
+[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.txt
+[info]
+Done. Audio=133.8s Wall=50.53s RTF=0.38x
+
+========================================================================
+[info] [3/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.wav
+========================================================================
+[info] File: call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.wav
+[info] Audio: 48000Hz 2ch 16bit 208.1s
+[info] Language: en-US
+[info] Realtime simulation: False
+[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+
+[info] Resampling audio from 48000Hz → 16000Hz
+[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
+[final]  Hello, thank you for calling inspira financial for this call. Would you prefer to continue in English or Spanish language  (TTFB 388ms)
+[final]  English.  (TTFB 684ms)
+[final]  Thank you.  (TTFB 498ms)
+[partial] Your language preference for this call is set to English.    [info] File sent — sending EOF and waiting for final results...
+[final]  Your language preference for this call is set to English. How can I help you today?  (TTFB 543ms)
+[final]  I have not received the verification code on my mobile.  (TTFB 625ms)
+[final]  I'm sorry to hear you're having trouble your verification co code. I understand how frustrating that can be.  (TTFB 799ms)
+[final]  I can help you with that.  (TTFB 183ms)
+[partial] To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit di[partial] To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit di[final]  To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit digits of your social security number?  (TTFB 423ms)
+[final]  Sure, it's two zero four three and one two three four.  (TTFB 995ms)
+[final]  Okay let me verify.  (TTFB 775ms)
+[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frustrating that can be. I'll reset your login code alert now thought, let me reset the alert so you can receive the    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
+[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.txt
+[info]
