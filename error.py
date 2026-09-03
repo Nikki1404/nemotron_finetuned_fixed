@@ -32,6 +32,8 @@ docker run -d \
     --port 8002 \
     --ws-ping-interval 20 \
     --ws-ping-timeout 120
+
+
 #!/usr/bin/env python3
 
 import argparse
@@ -65,7 +67,7 @@ CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2
 # reopen the WebSocket before the server/infra kills it out from under us.
 DEFAULT_ROTATE_SOFT_SEC = 180   # rotate at the next finalized utterance after this
 DEFAULT_ROTATE_HARD_SEC = 210   # force-rotate here regardless, leaving time to flush before ~240s
-EOF_WAIT_SEC = 20               # how long to wait for "done" after sending eof during rotation
+DEFAULT_EOF_WAIT_SEC = 120      # max seconds to wait for server "done" after sending EOF
 RECONNECT_BACKOFF_SEC = 1.5
 
 EOF_SENTINEL = object()
@@ -187,7 +189,7 @@ async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event, f
         leg_done.set()
 
 
-async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts):
+async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts, eof_wait):
     """
     Runs a single WebSocket connection ("leg") until it's time to rotate,
     the caller asked to stop, or the input source is fully drained.
@@ -254,15 +256,24 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
             pass
 
         try:
-            await asyncio.wait_for(leg_done.wait(), timeout=EOF_WAIT_SEC)
+            await asyncio.wait_for(leg_done.wait(), timeout=eof_wait)
         except asyncio.TimeoutError:
-            print_info(f"[session {session_num}] timed out waiting for flush")
+            print_info(
+                f"[session {session_num}] timed out after {eof_wait}s "
+                f"waiting for server flush/done"
+            )
 
-        recv_task.cancel()
+        if not recv_task.done():
+            recv_task.cancel()
+
         try:
             await recv_task
-        except Exception:
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException on modern Python versions,
+            # so `except Exception` does not catch it.
             pass
+        except Exception as e:
+            print_info(f"[session {session_num}] receiver ended with: {e}")
 
         if reason == "soft_rotate":
             print_info(f"[session {session_num}] rotating connection at {elapsed:.0f}s (after a finalized utterance)")
@@ -272,7 +283,7 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
         return input_finished
 
 
-async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard, final_texts=None):
+async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard, final_texts=None, eof_wait=DEFAULT_EOF_WAIT_SEC):
     session_num = 0
     input_finished = False
     if final_texts is None:
@@ -282,7 +293,7 @@ async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rota
         session_num += 1
         try:
             input_finished = await _run_one_leg(
-                url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts
+                url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts, eof_wait
             )
         except (websockets.exceptions.ConnectionClosed, OSError) as e:
             print_info(f"[session {session_num}] connection dropped ({e}) — reconnecting")
@@ -300,6 +311,7 @@ async def run_file(
     rotate_soft: int,
     rotate_hard: int,
     save_transcript: bool = False,
+    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
 ):
     wav_path = Path(path)
 
@@ -392,6 +404,7 @@ async def run_file(
             rotate_soft,
             rotate_hard,
             final_texts,
+            eof_wait=eof_wait,
         )
     except KeyboardInterrupt:
         print_info("Interrupted while sending audio")
@@ -432,6 +445,7 @@ async def run_folder(
     rotate_soft: int,
     rotate_hard: int,
     recursive: bool = False,
+    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
 ):
     folder_path = Path(folder)
 
@@ -473,6 +487,7 @@ async def run_folder(
                 rotate_soft,
                 rotate_hard,
                 save_transcript=True,
+                eof_wait=eof_wait,
             )
             if transcript is None:
                 failed += 1
@@ -685,6 +700,12 @@ def main():
     parser.add_argument("--recursive", action="store_true", help="[--folder only] Also process WAV files in subfolders")
     parser.add_argument("--url", default=SERVER_URL, help="WebSocket URL (wss://.../asr/realtime-custom-vad)")
     parser.add_argument("--health", action="store_true")
+    parser.add_argument(
+        "--eof-wait",
+        type=int,
+        default=DEFAULT_EOF_WAIT_SEC,
+        help=f"[--file/--folder] max seconds to wait for the server to flush and send done after EOF (default: {DEFAULT_EOF_WAIT_SEC})",
+    )
 
     # Connection rotation workaround (mic/file WebSocket modes)
     parser.add_argument(
@@ -762,6 +783,7 @@ def main():
                 rotate_soft,
                 rotate_hard,
                 recursive=args.recursive,
+                eof_wait=args.eof_wait,
             )
         )
     else:
@@ -773,88 +795,10 @@ def main():
                 args.url,
                 rotate_soft,
                 rotate_hard,
+                eof_wait=args.eof_wait,
             )
         )
 
 
 if __name__ == "__main__":
     main()
-
-
-(venv) PS C:\Users\re_nikitav\Documents\asr\nemotron_finetuned> python C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py --folder C:\Users\re_nikitav\Downloads\recordings\recording_wav --language en-US
-[info] Server health: {'status': 'ok', 'engines': ['nemotron'], 'device': 'cuda', 'sample_rate': 16000, 'audio_log_dir': '/srv/audio_logs'}
-[info] Found 9 WAV file(s) in C:\Users\re_nikitav\Downloads\recordings\recording_wav
-[info] Each transcript will be saved beside its WAV as <filename>.txt
-
-
-========================================================================
-[info] [1/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
-========================================================================
-[info] File: call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
-[info] Audio: 48000Hz 2ch 16bit 145.2s
-[info] Language: en-US
-[info] Realtime simulation: False
-[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-
-[info] Resampling audio from 48000Hz → 16000Hz
-[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish  [partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank    [info] File sent — sending EOF and waiting for final results...
-[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish l[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I woul[partial] Hello, thank you for calling and spear of financial for this call. Would you prefer to continue you in English or Spanish language English please? Thank you. Your language preference for this is call is set to English. How can I help with you today? I would like to update my phone number on my account. I can help you    [info] [session 1] timed out waiting for flush
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 745, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 720, in main
-    asyncio.run(
-    ~~~~~~~~~~~^
-        run_folder(
-        ^^^^^^^^^^^
-    ...<7 lines>...
-        )
-        ^
-    )
-    ^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 432, in run_folder
-    transcript = await run_file(
-                 ^^^^^^^^^^^^^^^
-    ...<7 lines>...
-    )
-    ^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 351, in run_file
-    await stream_forever(
-    ...<7 lines>...
-    )
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 248, in stream_forever
-    input_finished = await _run_one_leg(
-                     ^^^^^^^^^^^^^^^^^^^
-        url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 227, in _run_one_leg
-    await recv_task
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py", line 114, in _receive_loop
-    async for raw in ws:
-    ...<29 lines>...
-            print(f"\n[server error] {text}")
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\connection.py", line 236, in __aiter__
-    yield await self.recv()
-          ^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\connection.py", line 297, in recv
-    return await self.recv_messages.get(decode)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\messages.py", line 158, in get
-    frame = await self.frames.get(not self.closed)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\venv\Lib\site-packages\websockets\asyncio\messages.py", line 51, in get
-    await self.get_waiter
-asyncio.exceptions.CancelledError
