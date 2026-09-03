@@ -54,21 +54,41 @@ import numpy as np
 import resampy
 import websockets
 
-#SERVER_URL = "ws://localhost:8002/asr/realtime-custom-vad"
-SERVER_URL = "wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad"
+
+# ---------------------------------------------------------------------
+# Server / audio configuration
+# ---------------------------------------------------------------------
+
+# SERVER_URL = "ws://localhost:8002/asr/realtime-custom-vad"
+SERVER_URL = (
+    "wss://nemotron-3-5-150916788856."
+    "us-central1.run.app/asr/realtime-custom-vad"
+)
 
 SAMPLE_RATE = 16000
 CHUNK_MS = 100
 CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2
 
-# --- WebSocket rotation workaround (avoids Cloud Run's ~2-minute cutoff) ---
-# The real fix is server-side (see Dockerfile CMD --ws-ping-timeout and the
-# Cloud Run service's --timeout). This is a band-aid: proactively close and
-# reopen the WebSocket before the server/infra kills it out from under us.
-DEFAULT_ROTATE_SOFT_SEC = 180   # rotate at the next finalized utterance after this
-DEFAULT_ROTATE_HARD_SEC = 210   # force-rotate here regardless, leaving time to flush before ~240s
-DEFAULT_EOF_WAIT_SEC = 120      # max seconds to wait for server "done" after sending EOF
+# File streaming:
+#   1.0 = realtime
+#   2.0 = twice realtime
+#   4.0 = four times realtime
+#
+# For this streaming ASR endpoint, 2x is a safer batch default than dumping
+# the complete audio as fast as the client can send it.
+DEFAULT_SEND_SPEED = 2.0
+
+# Maximum time to wait for the server's explicit {"type": "done"} after EOF.
+DEFAULT_EOF_WAIT_SEC = 240
+
+# WebSocket rotation safeguard.
+DEFAULT_ROTATE_SOFT_SEC = 180
+DEFAULT_ROTATE_HARD_SEC = 210
+
 RECONNECT_BACKOFF_SEC = 1.5
+
+# Number of complete-file retries if the WebSocket dies before server "done".
+DEFAULT_FILE_RETRIES = 2
 
 EOF_SENTINEL = object()
 
@@ -76,12 +96,17 @@ GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
 MAGENTA = "\033[95m"
+RED = "\033[91m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 
 _LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
 
+
+# ---------------------------------------------------------------------
+# Console helpers
+# ---------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
     return _LANG_TAG_RE.sub("", text or "").strip()
@@ -94,19 +119,27 @@ def print_partial(text: str):
 
 def print_final(text: str, ttfb_ms=None):
     ttfb_str = f"  {DIM}(TTFB {ttfb_ms}ms){RESET}" if ttfb_ms else ""
-    sys.stdout.write(f"\r{GREEN}{BOLD}[final]  {RESET}{GREEN}{text}{RESET}{ttfb_str}\n")
+    sys.stdout.write(
+        f"\r{GREEN}{BOLD}[final]  {RESET}{GREEN}{text}{RESET}{ttfb_str}\n"
+    )
     sys.stdout.flush()
 
 
 def print_corrections(corrections):
     if not corrections:
         return
-    sys.stdout.write(f"  {MAGENTA}[corrections]{RESET} {DIM}{corrections}{RESET}\n")
+    sys.stdout.write(
+        f"  {MAGENTA}[corrections]{RESET} {DIM}{corrections}{RESET}\n"
+    )
     sys.stdout.flush()
 
 
 def print_info(msg: str):
     print(f"{CYAN}[info]{RESET} {msg}")
+
+
+def print_error(msg: str):
+    print(f"{RED}[error]{RESET} {msg}")
 
 
 def http_host_from_ws_url(url: str) -> str:
@@ -115,38 +148,114 @@ def http_host_from_ws_url(url: str) -> str:
     return f"{scheme}://{parsed.netloc}"
 
 
+# ---------------------------------------------------------------------
+# Audio normalization
+# ---------------------------------------------------------------------
+
 def upsample_if_needed(pcm: bytes, client_sample_rate: int) -> bytes:
     """
-    Convert mono PCM16 audio from client_sample_rate to SAMPLE_RATE (16 kHz).
+    Resample mono PCM16 audio to SAMPLE_RATE (16 kHz).
 
-    Despite the historical name, this handles both upsampling and downsampling.
-    If the input is already 16 kHz, the original bytes are returned unchanged.
+    Despite the historical function name, this performs both upsampling
+    and downsampling:
+        8 kHz  -> 16 kHz
+        48 kHz -> 16 kHz
+        16 kHz -> unchanged
     """
     if not pcm or client_sample_rate == SAMPLE_RATE:
         return pcm
 
-    print_info(f"Resampling audio from {client_sample_rate}Hz → {SAMPLE_RATE}Hz")
+    print_info(
+        f"Resampling audio from {client_sample_rate}Hz → {SAMPLE_RATE}Hz"
+    )
 
     x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    y = resampy.resample(x, client_sample_rate, SAMPLE_RATE)
+
+    y = resampy.resample(
+        x,
+        client_sample_rate,
+        SAMPLE_RATE,
+    )
+
     y = np.clip(y, -1.0, 1.0)
 
     return (y * 32767.0).astype(np.int16).tobytes()
 
 
-# ---------------------------------------------------------------------
-# Shared streaming core (used by both --mic and --file):
-# pulls PCM16 chunks off an asyncio.Queue and sends them over a WebSocket,
-# rotating the connection before the server-side timeout kills it, and
-# reconnecting transparently. Chunks pulled off the queue but not yet
-# successfully sent are requeued so no audio is silently dropped.
-# ---------------------------------------------------------------------
-async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event, final_texts: list[str]):
+def load_wav_as_16k_mono_pcm16(wav_path: Path):
     """
-    Reads server events for one WebSocket leg. Only ever prints a line as
-    [final] when the server actually sends a 'final' event — an unconfirmed
-    trailing [partial] is never promoted to a final result, including when
-    a leg ends due to rotation, a dropped connection, or Ctrl+C.
+    Read a PCM16 WAV, convert multi-channel audio to mono, then resample
+    to 16 kHz PCM16.
+
+    Returns:
+        raw_bytes, original_sr, n_channels, sample_width, duration_sec
+    """
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            file_sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw_audio = wf.readframes(n_frames)
+    except (wave.Error, EOFError) as e:
+        raise ValueError(f"Could not read WAV file: {e}") from e
+
+    if sample_width != 2:
+        raise ValueError(
+            f"Expected 16-bit PCM WAV, got {sample_width * 8}-bit audio"
+        )
+
+    if file_sr <= 0:
+        raise ValueError(f"Invalid sample rate: {file_sr}")
+
+    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
+
+    if n_channels > 1:
+        if len(audio_i16) % n_channels != 0:
+            raise ValueError("Invalid interleaved PCM channel data")
+
+        audio_i16 = (
+            audio_i16.reshape(-1, n_channels)
+            .astype(np.float32)
+            .mean(axis=1)
+            .clip(-32768, 32767)
+            .astype(np.int16)
+        )
+
+    raw_bytes = upsample_if_needed(
+        audio_i16.tobytes(),
+        file_sr,
+    )
+
+    duration_sec = len(np.frombuffer(raw_bytes, dtype=np.int16)) / SAMPLE_RATE
+
+    return (
+        raw_bytes,
+        file_sr,
+        n_channels,
+        sample_width,
+        duration_sec,
+    )
+
+
+# ---------------------------------------------------------------------
+# WebSocket receive / one connection leg
+# ---------------------------------------------------------------------
+
+async def _receive_loop(
+    ws,
+    got_final: asyncio.Event,
+    server_done: asyncio.Event,
+    final_texts: list[str],
+):
+    """
+    Receive ASR events.
+
+    IMPORTANT:
+    server_done is set ONLY when the server explicitly sends:
+        {"type": "done"}
+
+    A dropped WebSocket is NOT considered successful completion.
     """
     try:
         async for raw in ws:
@@ -172,46 +281,142 @@ async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event, f
                     print_final(text, ttfb)
                     print_corrections(corrections)
                     final_texts.append(text)
+
                 got_final.set()
 
             elif ev_type == "done":
-                leg_done.set()
-                break
+                server_done.set()
+                return
 
             elif ev_type == "error":
-                print(f"\n[server error] {text}")
+                raise RuntimeError(
+                    text or f"Server returned ASR error: {msg}"
+                )
+
+    except asyncio.CancelledError:
+        raise
 
     except websockets.exceptions.ConnectionClosed as e:
-        print_info(f"[receive] connection closed: {e}")
-    except Exception as e:
-        print(f"\n[receive error] {e}")
-    finally:
-        leg_done.set()
+        raise ConnectionError(
+            f"WebSocket closed before server completion: {e}"
+        ) from e
 
 
-async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts, eof_wait):
+async def _wait_for_server_done(
+    recv_task: asyncio.Task,
+    server_done: asyncio.Event,
+    eof_wait: int,
+):
     """
-    Runs a single WebSocket connection ("leg") until it's time to rotate,
-    the caller asked to stop, or the input source is fully drained.
-    Returns True if the input source is fully finished (EOF_SENTINEL seen).
+    Wait for either:
+      1. explicit server "done", or
+      2. receiver failure.
+
+    This avoids waiting the entire EOF timeout after the WebSocket has
+    already died.
+    """
+    done_wait_task = asyncio.create_task(server_done.wait())
+
+    try:
+        finished, _ = await asyncio.wait(
+            {recv_task, done_wait_task},
+            timeout=eof_wait,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not finished:
+            raise TimeoutError(
+                f"Timed out after {eof_wait}s waiting for server done"
+            )
+
+        if recv_task in finished:
+            # Propagate receiver errors immediately.
+            exc = recv_task.exception()
+
+            if exc is not None:
+                raise exc
+
+            # Receiver exited cleanly but no explicit server "done".
+            if not server_done.is_set():
+                raise ConnectionError(
+                    "Receiver stopped before server sent done"
+                )
+
+        if server_done.is_set():
+            return
+
+        raise ConnectionError(
+            "Server connection ended without a done event"
+        )
+
+    finally:
+        if not done_wait_task.done():
+            done_wait_task.cancel()
+
+        try:
+            await done_wait_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _run_one_leg(
+    url,
+    language,
+    queue,
+    stop_all_event,
+    session_num,
+    rotate_soft,
+    rotate_hard,
+    final_texts,
+    eof_wait,
+):
+    """
+    Run one WebSocket connection leg.
+
+    Returns:
+        True  -> input EOF was reached and server confirmed done
+        False -> connection was rotated and more input remains
     """
     print_info(f"[session {session_num}] connecting to {url}")
 
-    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-        await ws.send(json.dumps({
-            "backend": "nemotron",
-            "sample_rate": SAMPLE_RATE,
-            "language": language,
-        }))
+    # ping_interval=None disables client-side keepalive ping timeouts.
+    #
+    # This is intentional for the batch-file case because the server may
+    # spend a significant amount of time doing inference after receiving
+    # buffered audio. The previous 20s ping timeout was closing otherwise
+    # active ASR sessions before transcription completed.
+    async with websockets.connect(
+        url,
+        ping_interval=None,
+        close_timeout=10,
+        max_size=None,
+    ) as ws:
+
+        await ws.send(
+            json.dumps(
+                {
+                    "backend": "nemotron",
+                    "sample_rate": SAMPLE_RATE,
+                    "language": language,
+                }
+            )
+        )
 
         got_final = asyncio.Event()
-        leg_done = asyncio.Event()
-        recv_task = asyncio.create_task(_receive_loop(ws, got_final, leg_done, final_texts))
+        server_done = asyncio.Event()
 
-        leg_start = time.time()
+        recv_task = asyncio.create_task(
+            _receive_loop(
+                ws,
+                got_final,
+                server_done,
+                final_texts,
+            )
+        )
+
+        leg_start = time.monotonic()
         input_finished = False
         reason = "stopped"
-        elapsed = 0.0
 
         try:
             while True:
@@ -219,18 +424,37 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
                     reason = "stopped"
                     break
 
-                elapsed = time.time() - leg_start
+                # Detect receiver failure immediately while we're still sending.
+                if recv_task.done():
+                    exc = recv_task.exception()
+                    if exc is not None:
+                        raise exc
+
+                    if server_done.is_set():
+                        return input_finished
+
+                    raise ConnectionError(
+                        "Receiver stopped before input completed"
+                    )
+
+                elapsed = time.monotonic() - leg_start
 
                 if elapsed >= rotate_hard:
                     reason = "hard_rotate"
                     break
 
-                if elapsed >= rotate_soft and got_final.is_set():
+                if (
+                    elapsed >= rotate_soft
+                    and got_final.is_set()
+                ):
                     reason = "soft_rotate"
                     break
 
                 try:
-                    chunk = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    chunk = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=0.5,
+                    )
                 except asyncio.TimeoutError:
                     continue
 
@@ -241,130 +465,116 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
 
                 try:
                     await ws.send(chunk)
-                except websockets.exceptions.ConnectionClosed:
-                    await queue.put(chunk)  # don't lose this chunk — retry on the next leg
-                    raise
 
-        except KeyboardInterrupt:
-            reason = "stopped"
-            stop_all_event.set()
+                except websockets.exceptions.ConnectionClosed as e:
+                    # Put unsent audio back so a rotated/reconnected leg
+                    # doesn't silently lose this chunk.
+                    await queue.put(chunk)
 
-        # Graceful flush before tearing down this leg.
-        try:
-            await ws.send(json.dumps({"type": "eof"}))
-        except Exception:
-            pass
+                    raise ConnectionError(
+                        f"WebSocket closed while sending audio: {e}"
+                    ) from e
 
-        try:
-            await asyncio.wait_for(leg_done.wait(), timeout=eof_wait)
-        except asyncio.TimeoutError:
-            print_info(
-                f"[session {session_num}] timed out after {eof_wait}s "
-                f"waiting for server flush/done"
+            # Tell the server to flush the current leg.
+            try:
+                await ws.send(json.dumps({"type": "eof"}))
+            except websockets.exceptions.ConnectionClosed as e:
+                raise ConnectionError(
+                    f"WebSocket closed while sending EOF: {e}"
+                ) from e
+
+            # Wait for explicit server "done".
+            await _wait_for_server_done(
+                recv_task,
+                server_done,
+                eof_wait,
             )
 
-        if not recv_task.done():
-            recv_task.cancel()
+            if reason == "soft_rotate":
+                print_info(
+                    f"[session {session_num}] rotating connection "
+                    f"after finalized utterance"
+                )
 
-        try:
-            await recv_task
-        except asyncio.CancelledError:
-            # CancelledError is a BaseException on modern Python versions,
-            # so `except Exception` does not catch it.
-            pass
-        except Exception as e:
-            print_info(f"[session {session_num}] receiver ended with: {e}")
+            elif reason == "hard_rotate":
+                print_info(
+                    f"[session {session_num}] force-rotating connection "
+                    f"at safety cutoff"
+                )
 
-        if reason == "soft_rotate":
-            print_info(f"[session {session_num}] rotating connection at {elapsed:.0f}s (after a finalized utterance)")
-        elif reason == "hard_rotate":
-            print_info(f"[session {session_num}] force-rotating connection at {elapsed:.0f}s (safety cutoff, mid-utterance)")
+            return input_finished
 
-        return input_finished
+        finally:
+            if not recv_task.done():
+                recv_task.cancel()
+
+            try:
+                await recv_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # The actual error has already been handled / propagated above.
+                pass
 
 
-async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard, final_texts=None, eof_wait=DEFAULT_EOF_WAIT_SEC):
-    session_num = 0
-    input_finished = False
+async def stream_forever(
+    url,
+    language,
+    queue,
+    stop_all_event,
+    rotate_soft,
+    rotate_hard,
+    final_texts=None,
+    eof_wait=DEFAULT_EOF_WAIT_SEC,
+):
+    """
+    Stream queue contents across one or more WebSocket legs.
+
+    Connection rotation is preserved, but a genuine connection failure is
+    propagated to the caller instead of being mistaken for successful EOF.
+    """
     if final_texts is None:
         final_texts = []
 
+    session_num = 0
+    input_finished = False
+
     while not stop_all_event.is_set() and not input_finished:
         session_num += 1
-        try:
-            input_finished = await _run_one_leg(
-                url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts, eof_wait
-            )
-        except (websockets.exceptions.ConnectionClosed, OSError) as e:
-            print_info(f"[session {session_num}] connection dropped ({e}) — reconnecting")
-            await asyncio.sleep(RECONNECT_BACKOFF_SEC)
+
+        input_finished = await _run_one_leg(
+            url=url,
+            language=language,
+            queue=queue,
+            stop_all_event=stop_all_event,
+            session_num=session_num,
+            rotate_soft=rotate_soft,
+            rotate_hard=rotate_hard,
+            final_texts=final_texts,
+            eof_wait=eof_wait,
+        )
 
 
 # ---------------------------------------------------------------------
 # File mode
 # ---------------------------------------------------------------------
-async def run_file(
-    path: str,
+
+async def _transcribe_file_attempt(
+    raw_bytes: bytes,
     language: str,
     realtime: bool,
+    send_speed: float,
     url: str,
     rotate_soft: int,
     rotate_hard: int,
-    save_transcript: bool = False,
-    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
+    eof_wait: int,
 ):
-    wav_path = Path(path)
+    """
+    One complete transcription attempt.
 
-    if not wav_path.exists():
-        print(f"File not found: {path}")
-        return None
-
-    try:
-        with wave.open(str(wav_path), "rb") as wf:
-            n_channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            file_sr = wf.getframerate()
-            n_frames = wf.getnframes()
-            raw_audio = wf.readframes(n_frames)
-    except (wave.Error, EOFError) as e:
-        print(f"[error] Could not read WAV file {wav_path}: {e}")
-        return None
-
-    if sample_width != 2:
-        print(
-            f"[error] {wav_path.name}: expected 16-bit PCM WAV, "
-            f"got {sample_width * 8}-bit audio"
-        )
-        return None
-
-    print_info(f"File: {wav_path.name}")
-    print_info(
-        f"Audio: {file_sr}Hz {n_channels}ch {sample_width * 8}bit "
-        f"{n_frames / file_sr:.1f}s"
-    )
-    print_info(f"Language: {language}")
-    print_info(f"Realtime simulation: {realtime}")
-    print_info(f"Connecting to {url}\n")
-
-    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
-
-    # Convert any channel count to mono before resampling.
-    if n_channels > 1:
-        if len(audio_i16) % n_channels != 0:
-            print(f"[error] {wav_path.name}: invalid interleaved PCM data")
-            return None
-        audio_i16 = (
-            audio_i16.reshape(-1, n_channels)
-            .astype(np.float32)
-            .mean(axis=1)
-            .clip(-32768, 32767)
-            .astype(np.int16)
-        )
-
-    # Centralized sample-rate conversion to 16 kHz.
-    raw_bytes = upsample_if_needed(audio_i16.tobytes(), file_sr)
-    audio_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
-
+    Returns the complete list of confirmed final utterances only if the
+    server reaches explicit "done".
+    """
     chunks = [
         raw_bytes[i:i + CHUNK_BYTES]
         for i in range(0, len(raw_bytes), CHUNK_BYTES)
@@ -374,67 +584,174 @@ async def run_file(
     stop_all_event = asyncio.Event()
     final_texts: list[str] = []
 
+    effective_speed = 1.0 if realtime else send_speed
+
     async def producer():
-        t_start = time.time()
+        t_start = time.monotonic()
 
         for i, chunk in enumerate(chunks):
             await queue.put(chunk)
 
-            if realtime:
-                expected_elapsed = (i + 1) * CHUNK_MS / 1000.0
-                actual_elapsed = time.time() - t_start
-                sleep_for = expected_elapsed - actual_elapsed
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-            else:
-                await asyncio.sleep(0.001)
+            expected_elapsed = (
+                ((i + 1) * CHUNK_MS / 1000.0)
+                / effective_speed
+            )
 
-        print_info("File sent — sending EOF and waiting for final results...")
+            actual_elapsed = time.monotonic() - t_start
+            sleep_for = expected_elapsed - actual_elapsed
+
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        print_info(
+            "File sent — sending EOF and waiting for final results..."
+        )
+
         await queue.put(EOF_SENTINEL)
 
-    t_start = time.time()
     prod_task = asyncio.create_task(producer())
 
     try:
         await stream_forever(
-            url,
-            language,
-            queue,
-            stop_all_event,
-            rotate_soft,
-            rotate_hard,
-            final_texts,
+            url=url,
+            language=language,
+            queue=queue,
+            stop_all_event=stop_all_event,
+            rotate_soft=rotate_soft,
+            rotate_hard=rotate_hard,
+            final_texts=final_texts,
             eof_wait=eof_wait,
         )
-    except KeyboardInterrupt:
-        print_info("Interrupted while sending audio")
+
+        return final_texts
+
+    finally:
         stop_all_event.set()
 
-    prod_task.cancel()
+        if not prod_task.done():
+            prod_task.cancel()
+
+        try:
+            await prod_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def run_file(
+    path: str,
+    language: str,
+    realtime: bool,
+    url: str,
+    rotate_soft: int,
+    rotate_hard: int,
+    save_transcript: bool = False,
+    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
+    send_speed: float = DEFAULT_SEND_SPEED,
+    file_retries: int = DEFAULT_FILE_RETRIES,
+):
+    wav_path = Path(path)
+
+    if not wav_path.exists():
+        print_error(f"File not found: {path}")
+        return None
+
+    if not wav_path.is_file():
+        print_error(f"Not a file: {path}")
+        return None
+
     try:
-        await prod_task
-    except asyncio.CancelledError:
-        pass
+        (
+            raw_bytes,
+            file_sr,
+            n_channels,
+            sample_width,
+            audio_sec,
+        ) = load_wav_as_16k_mono_pcm16(wav_path)
 
-    elapsed = time.time() - t_start
-    audio_sec = len(audio_i16) / SAMPLE_RATE
-    rtf = elapsed / audio_sec if audio_sec > 0 else 0
+    except ValueError as e:
+        print_error(f"{wav_path.name}: {e}")
+        return None
 
-    transcript = "\n".join(final_texts).strip()
-
-    if save_transcript:
-        transcript_path = wav_path.with_suffix(".txt")
-        transcript_path.write_text(
-            transcript + ("\n" if transcript else ""),
-            encoding="utf-8",
-        )
-        print_info(f"Transcript saved: {transcript_path}")
-
+    print_info(f"File: {wav_path.name}")
     print_info(
-        f"\nDone. Audio={audio_sec:.1f}s Wall={elapsed:.2f}s RTF={rtf:.2f}x"
+        f"Audio: {file_sr}Hz {n_channels}ch "
+        f"{sample_width * 8}bit {audio_sec:.1f}s"
     )
+    print_info(f"Language: {language}")
+    print_info(
+        f"Send speed: {'1.0x realtime' if realtime else f'{send_speed:.2f}x realtime'}"
+    )
+    print_info(f"Connecting to {url}\n")
 
-    return transcript
+    total_start = time.monotonic()
+
+    attempts = max(1, file_retries + 1)
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            print_info(
+                f"Retrying entire file from the beginning "
+                f"(attempt {attempt}/{attempts})..."
+            )
+
+        try:
+            final_texts = await _transcribe_file_attempt(
+                raw_bytes=raw_bytes,
+                language=language,
+                realtime=realtime,
+                send_speed=send_speed,
+                url=url,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
+                eof_wait=eof_wait,
+            )
+
+            transcript = "\n".join(final_texts).strip()
+
+            elapsed = time.monotonic() - total_start
+            rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
+
+            if save_transcript:
+                transcript_path = wav_path.with_suffix(".txt")
+
+                transcript_path.write_text(
+                    transcript + ("\n" if transcript else ""),
+                    encoding="utf-8",
+                )
+
+                print_info(
+                    f"Transcript saved: {transcript_path}"
+                )
+
+            print_info(
+                f"\nDone. Audio={audio_sec:.1f}s "
+                f"Wall={elapsed:.2f}s RTF={rtf:.2f}x"
+            )
+
+            return transcript
+
+        except (
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            websockets.exceptions.WebSocketException,
+        ) as e:
+            print_error(
+                f"{wav_path.name}: transcription attempt "
+                f"{attempt}/{attempts} failed: {e}"
+            )
+
+            if attempt < attempts:
+                await asyncio.sleep(RECONNECT_BACKOFF_SEC)
+                continue
+
+            # Never save a normal .txt for an incomplete transcription.
+            print_error(
+                f"{wav_path.name}: server never confirmed complete "
+                f"transcription after {attempts} attempt(s)."
+            )
+
+            return None
 
 
 async def run_folder(
@@ -446,114 +763,172 @@ async def run_folder(
     rotate_hard: int,
     recursive: bool = False,
     eof_wait: int = DEFAULT_EOF_WAIT_SEC,
+    send_speed: float = DEFAULT_SEND_SPEED,
+    file_retries: int = DEFAULT_FILE_RETRIES,
 ):
     folder_path = Path(folder)
 
     if not folder_path.exists():
-        print(f"Folder not found: {folder}")
+        print_error(f"Folder not found: {folder}")
         return
 
     if not folder_path.is_dir():
-        print(f"Not a folder: {folder}")
+        print_error(f"Not a folder: {folder}")
         return
 
     pattern = "**/*.wav" if recursive else "*.wav"
+
     wav_files = sorted(
-        (p for p in folder_path.glob(pattern) if p.is_file()),
+        (
+            p
+            for p in folder_path.glob(pattern)
+            if p.is_file()
+        ),
         key=lambda p: str(p).lower(),
     )
 
     if not wav_files:
-        print(f"No WAV files found in: {folder_path}")
+        print_error(
+            f"No WAV files found in: {folder_path}"
+        )
         return
 
-    print_info(f"Found {len(wav_files)} WAV file(s) in {folder_path}")
-    print_info("Each transcript will be saved beside its WAV as <filename>.txt\n")
+    print_info(
+        f"Found {len(wav_files)} WAV file(s) in {folder_path}"
+    )
+    print_info(
+        "A .txt file is written only after the server explicitly "
+        "confirms transcription completion.\n"
+    )
 
     succeeded = 0
     failed = 0
 
-    for index, wav_path in enumerate(wav_files, start=1):
+    for index, wav_path in enumerate(
+        wav_files,
+        start=1,
+    ):
         print("\n" + "=" * 72)
-        print_info(f"[{index}/{len(wav_files)}] Processing: {wav_path}")
+        print_info(
+            f"[{index}/{len(wav_files)}] Processing: {wav_path}"
+        )
         print("=" * 72)
 
         try:
             transcript = await run_file(
-                str(wav_path),
-                language,
-                realtime,
-                url,
-                rotate_soft,
-                rotate_hard,
+                path=str(wav_path),
+                language=language,
+                realtime=realtime,
+                url=url,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
                 save_transcript=True,
                 eof_wait=eof_wait,
+                send_speed=send_speed,
+                file_retries=file_retries,
             )
+
             if transcript is None:
                 failed += 1
             else:
                 succeeded += 1
+
+        except KeyboardInterrupt:
+            raise
+
         except Exception as e:
             failed += 1
-            print(f"[error] Failed to process {wav_path.name}: {e}")
+            print_error(
+                f"Unexpected failure processing "
+                f"{wav_path.name}: {e}"
+            )
 
     print("\n" + "=" * 72)
     print_info(
-        f"Folder complete. Total={len(wav_files)} "
-        f"Succeeded={succeeded} Failed={failed}"
+        f"Folder complete. "
+        f"Total={len(wav_files)} "
+        f"Succeeded={succeeded} "
+        f"Failed={failed}"
     )
 
 
 # ---------------------------------------------------------------------
 # Mic mode
 # ---------------------------------------------------------------------
-async def run_mic(language: str, url: str, rotate_soft: int, rotate_hard: int):
+
+async def run_mic(
+    language: str,
+    url: str,
+    rotate_soft: int,
+    rotate_hard: int,
+    eof_wait: int,
+):
     try:
         import sounddevice as sd
     except ImportError:
-        print("sounddevice not installed. Run: pip install sounddevice")
+        print(
+            "sounddevice not installed. "
+            "Run: pip install sounddevice"
+        )
         sys.exit(1)
 
     print_info(f"Connecting to {url}")
     print_info(f"Language: {language}")
-    print_info(
-        f"Auto-rotating the WebSocket every ~{rotate_soft}-{rotate_hard}s "
-        f"to work around the server's connection limit."
-    )
     print_info("Speak into your microphone. Press Ctrl+C to stop.\n")
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     stop_all_event = asyncio.Event()
 
-    def audio_callback(indata, frames, time_info, status):
-        pcm = (indata[:, 0] * 32767).astype("int16").tobytes()
-        loop.call_soon_threadsafe(queue.put_nowait, pcm)
+    def audio_callback(
+        indata,
+        frames,
+        time_info,
+        status,
+    ):
+        pcm = (
+            indata[:, 0] * 32767
+        ).astype("int16").tobytes()
+
+        loop.call_soon_threadsafe(
+            queue.put_nowait,
+            pcm,
+        )
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",
-        blocksize=int(SAMPLE_RATE * CHUNK_MS / 1000),
+        blocksize=int(
+            SAMPLE_RATE * CHUNK_MS / 1000
+        ),
         callback=audio_callback,
     ):
-        # The mic keeps filling `queue` via the callback above regardless of
-        # WebSocket connection state, so no audio is lost while rotating.
         try:
-            await stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard)
+            await stream_forever(
+                url=url,
+                language=language,
+                queue=queue,
+                stop_all_event=stop_all_event,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
+                eof_wait=eof_wait,
+            )
+
         except KeyboardInterrupt:
             print_info("Stopping...")
             stop_all_event.set()
 
 
 # ---------------------------------------------------------------------
-# OpenAI-compatible HTTP endpoint test (/v1/audio/transcriptions)
+# OpenAI-compatible HTTP endpoint
 # ---------------------------------------------------------------------
-def _build_multipart_form(fields: dict, file_field: str, file_path: Path):
-    """
-    Minimal stdlib multipart/form-data encoder (no 'requests' dependency),
-    matching what FastAPI's File()/Form() parameters on the server expect.
-    """
+
+def _build_multipart_form(
+    fields: dict,
+    file_field: str,
+    file_path: Path,
+):
     boundary = uuid.uuid4().hex
     CRLF = "\r\n"
     body = bytearray()
@@ -561,19 +936,37 @@ def _build_multipart_form(fields: dict, file_field: str, file_path: Path):
     for name, value in fields.items():
         if value is None:
             continue
-        body.extend(f"--{boundary}{CRLF}".encode())
+
         body.extend(
-            f'Content-Disposition: form-data; name="{name}"{CRLF}{CRLF}'.encode()
+            f"--{boundary}{CRLF}".encode()
         )
-        body.extend(f"{value}{CRLF}".encode())
+
+        body.extend(
+            (
+                f'Content-Disposition: form-data; '
+                f'name="{name}"{CRLF}{CRLF}'
+            ).encode()
+        )
+
+        body.extend(
+            f"{value}{CRLF}".encode()
+        )
 
     filename = file_path.name
-    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    body.extend(f"--{boundary}{CRLF}".encode())
+    content_type = (
+        mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+
+    body.extend(
+        f"--{boundary}{CRLF}".encode()
+    )
+
     body.extend(
         (
-            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'Content-Disposition: form-data; '
+            f'name="{file_field}"; '
             f'filename="{filename}"{CRLF}'
             f"Content-Type: {content_type}{CRLF}{CRLF}"
         ).encode()
@@ -583,10 +976,15 @@ def _build_multipart_form(fields: dict, file_field: str, file_path: Path):
         body.extend(f.read())
 
     body.extend(CRLF.encode())
-    body.extend(f"--{boundary}--{CRLF}".encode())
 
-    content_type_header = f"multipart/form-data; boundary={boundary}"
-    return bytes(body), content_type_header
+    body.extend(
+        f"--{boundary}--{CRLF}".encode()
+    )
+
+    return (
+        bytes(body),
+        f"multipart/form-data; boundary={boundary}",
+    )
 
 
 async def run_openai_http(
@@ -596,16 +994,11 @@ async def run_openai_http(
     model: str,
     response_format: str,
 ):
-    """
-    Tests the OpenAI-compatible /v1/audio/transcriptions endpoint.
-    Sends the whole file in one multipart POST (non-streaming), the same
-    way LiveKit or any OpenAI-SDK-compatible client would.
-    """
     wav_path = Path(path)
 
     if not wav_path.exists():
-        print(f"File not found: {path}")
-        sys.exit(1)
+        print_error(f"File not found: {path}")
+        return
 
     http_host = http_host_from_ws_url(url)
     endpoint = f"{http_host}/v1/audio/transcriptions"
@@ -626,256 +1019,377 @@ async def run_openai_http(
         file_path=wav_path,
     )
 
-    req = urllib.request.Request(endpoint, data=body, method="POST")
-    req.add_header("Content-Type", content_type)
-    req.add_header("Content-Length", str(len(body)))
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+    )
 
-    t_start = time.time()
+    req.add_header(
+        "Content-Type",
+        content_type,
+    )
+
+    req.add_header(
+        "Content-Length",
+        str(len(body)),
+    )
+
+    t_start = time.monotonic()
     loop = asyncio.get_running_loop()
 
     def _do_request():
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(
+                req,
+                timeout=300,
+            ) as resp:
                 return resp.status, resp.read()
+
         except urllib.error.HTTPError as e:
             return e.code, e.read()
+
         except urllib.error.URLError as e:
             return None, str(e).encode()
 
-    status, raw_resp = await loop.run_in_executor(None, _do_request)
-    elapsed = time.time() - t_start
+    status, raw_resp = await loop.run_in_executor(
+        None,
+        _do_request,
+    )
+
+    elapsed = time.monotonic() - t_start
 
     if status is None:
-        print(f"[error] Request failed: {raw_resp.decode(errors='replace')}")
+        print_error(
+            f"Request failed: "
+            f"{raw_resp.decode(errors='replace')}"
+        )
         return
 
     if status != 200:
-        print(f"[error] HTTP {status}: {raw_resp.decode(errors='replace')}")
+        print_error(
+            f"HTTP {status}: "
+            f"{raw_resp.decode(errors='replace')}"
+        )
         return
 
     if response_format == "text":
-        print_final(raw_resp.decode("utf-8", errors="replace"))
+        print_final(
+            raw_resp.decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
     else:
         try:
             data = json.loads(raw_resp)
+
         except json.JSONDecodeError:
-            print(f"[warn] Could not parse JSON response: {raw_resp[:500]!r}")
+            print_error(
+                "Could not parse JSON response"
+            )
             return
 
-        print_final(data.get("text", ""))
+        print_final(
+            data.get("text", "")
+        )
 
         if response_format == "verbose_json":
             print_info(
-                f"duration={data.get('duration')}s language={data.get('language')}"
+                f"duration={data.get('duration')}s "
+                f"language={data.get('language')}"
             )
 
-    print_info(f"\nDone. Wall={elapsed:.2f}s")
+    print_info(
+        f"\nDone. Wall={elapsed:.2f}s"
+    )
 
+
+# ---------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------
 
 async def check_health(url: str):
     try:
         http_host = http_host_from_ws_url(url)
 
-        with urllib.request.urlopen(f"{http_host}/health", timeout=5) as r:
+        with urllib.request.urlopen(
+            f"{http_host}/health",
+            timeout=5,
+        ) as r:
             data = json.loads(r.read())
 
-        print_info(f"Server health: {data}")
+        print_info(
+            f"Server health: {data}"
+        )
+
         return True
 
     except Exception as e:
-        print(f"[warn] Health check failed: {e} (server may still be starting)")
+        print(
+            f"[warn] Health check failed: {e} "
+            f"(server may still be starting)"
+        )
+
         return False
 
 
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Nemotron ASR client (WebSocket + OpenAI-compatible HTTP)")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Nemotron ASR client "
+            "(WebSocket + OpenAI-compatible HTTP)"
+        )
+    )
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--mic", action="store_true", help="Realtime WebSocket streaming from microphone")
-    mode.add_argument("--file", metavar="PATH", help="Send a WAV file (WebSocket streaming by default)")
-    mode.add_argument("--folder", metavar="PATH", help="Process all WAV files in a folder and save one transcript per file")
+    mode = parser.add_mutually_exclusive_group(
+        required=True
+    )
 
-    parser.add_argument("--language", default="en-US")
-    parser.add_argument("--realtime", action="store_true", help="[--file/--folder] Pace chunks to simulate realtime playback over the WebSocket")
-    parser.add_argument("--recursive", action="store_true", help="[--folder only] Also process WAV files in subfolders")
-    parser.add_argument("--url", default=SERVER_URL, help="WebSocket URL (wss://.../asr/realtime-custom-vad)")
-    parser.add_argument("--health", action="store_true")
+    mode.add_argument(
+        "--mic",
+        action="store_true",
+        help="Realtime WebSocket streaming from microphone",
+    )
+
+    mode.add_argument(
+        "--file",
+        metavar="PATH",
+        help="Send one WAV file",
+    )
+
+    mode.add_argument(
+        "--folder",
+        metavar="PATH",
+        help=(
+            "Process WAV files in a folder and save "
+            "one transcript per WAV"
+        ),
+    )
+
+    parser.add_argument(
+        "--language",
+        default="en-US",
+        help="Language code (default: en-US)",
+    )
+
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help=(
+            "[--file/--folder] send audio at 1x realtime "
+            "instead of --speed"
+        ),
+    )
+
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=DEFAULT_SEND_SPEED,
+        help=(
+            "[--file/--folder] file streaming speed when "
+            f"--realtime is not used (default: {DEFAULT_SEND_SPEED}x)"
+        ),
+    )
+
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "[--folder only] also process WAV files "
+            "inside subfolders"
+        ),
+    )
+
+    parser.add_argument(
+        "--url",
+        default=SERVER_URL,
+        help="WebSocket ASR URL",
+    )
+
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Run health check before transcription",
+    )
+
     parser.add_argument(
         "--eof-wait",
         type=int,
         default=DEFAULT_EOF_WAIT_SEC,
-        help=f"[--file/--folder] max seconds to wait for the server to flush and send done after EOF (default: {DEFAULT_EOF_WAIT_SEC})",
+        help=(
+            "[--file/--folder] maximum seconds to wait "
+            "for server done after EOF "
+            f"(default: {DEFAULT_EOF_WAIT_SEC})"
+        ),
     )
 
-    # Connection rotation workaround (mic/file WebSocket modes)
     parser.add_argument(
-        "--rotate-after", type=int, default=DEFAULT_ROTATE_SOFT_SEC,
-        help=f"[--mic/--file] seconds after which to rotate the WS connection at the next finalized "
-             f"utterance boundary (default: {DEFAULT_ROTATE_SOFT_SEC})",
-    )
-    parser.add_argument(
-        "--rotate-hard", type=int, default=DEFAULT_ROTATE_HARD_SEC,
-        help=f"[--mic/--file] hard cutoff in seconds to force-rotate even mid-utterance "
-             f"(default: {DEFAULT_ROTATE_HARD_SEC})",
-    )
-    parser.add_argument(
-        "--no-rotate", action="store_true",
-        help="[--mic/--file] disable connection rotation entirely (old behavior — will hit the server timeout on long calls)",
+        "--file-retries",
+        type=int,
+        default=DEFAULT_FILE_RETRIES,
+        help=(
+            "[--file/--folder] number of complete-file retries "
+            "after premature WebSocket failure "
+            f"(default: {DEFAULT_FILE_RETRIES})"
+        ),
     )
 
-    # OpenAI-compatible HTTP endpoint test
+    parser.add_argument(
+        "--rotate-after",
+        type=int,
+        default=DEFAULT_ROTATE_SOFT_SEC,
+        help=(
+            "seconds before rotating at the next "
+            "finalized utterance"
+        ),
+    )
+
+    parser.add_argument(
+        "--rotate-hard",
+        type=int,
+        default=DEFAULT_ROTATE_HARD_SEC,
+        help="hard WebSocket rotation cutoff",
+    )
+
+    parser.add_argument(
+        "--no-rotate",
+        action="store_true",
+        help="disable WebSocket rotation",
+    )
+
+    # OpenAI-compatible HTTP mode.
     parser.add_argument(
         "--openai",
         action="store_true",
-        help="Use the OpenAI-compatible HTTP /v1/audio/transcriptions endpoint "
-             "instead of the realtime WebSocket. Requires --file (not --mic).",
+        help=(
+            "Use /v1/audio/transcriptions instead "
+            "of WebSocket. Requires --file."
+        ),
     )
+
     parser.add_argument(
         "--model",
         default="nemotron-3.5-asr-streaming-0.6b",
-        help="[--openai only] model id, must match what the server expects",
+        help="[--openai only] model id",
     )
+
     parser.add_argument(
         "--response-format",
         default="json",
-        choices=["json", "text", "verbose_json"],
-        help="[--openai only] matches OpenAI's response_format param",
+        choices=[
+            "json",
+            "text",
+            "verbose_json",
+        ],
+        help="[--openai only] response format",
     )
 
     args = parser.parse_args()
 
-    if args.openai and args.mic:
-        parser.error("--openai requires --file; it can't be used with --mic")
+    if args.speed <= 0:
+        parser.error("--speed must be greater than 0")
 
-    if args.openai and args.folder:
-        parser.error("--openai currently supports --file only, not --folder")
+    if args.eof_wait <= 0:
+        parser.error("--eof-wait must be greater than 0")
+
+    if args.file_retries < 0:
+        parser.error("--file-retries cannot be negative")
 
     if args.recursive and not args.folder:
-        parser.error("--recursive can only be used with --folder")
+        parser.error(
+            "--recursive can only be used with --folder"
+        )
 
-    if args.rotate_after >= args.rotate_hard:
-        parser.error("--rotate-after must be less than --rotate-hard")
+    if args.openai and not args.file:
+        parser.error(
+            "--openai requires --file"
+        )
 
-    rotate_soft = 10**9 if args.no_rotate else args.rotate_after
-    rotate_hard = 10**9 if args.no_rotate else args.rotate_hard
+    if (
+        not args.no_rotate
+        and args.rotate_after >= args.rotate_hard
+    ):
+        parser.error(
+            "--rotate-after must be less than --rotate-hard"
+        )
 
-    if args.health:
-        asyncio.run(check_health(args.url))
-        return
+    rotate_soft = (
+        10**9
+        if args.no_rotate
+        else args.rotate_after
+    )
 
-    asyncio.run(check_health(args.url))
+    rotate_hard = (
+        10**9
+        if args.no_rotate
+        else args.rotate_hard
+    )
+
+    # Keep the existing behavior of checking health before use.
+    asyncio.run(
+        check_health(args.url)
+    )
 
     if args.openai:
         asyncio.run(
             run_openai_http(
-                args.file, args.language, args.url, args.model, args.response_format
+                path=args.file,
+                language=args.language,
+                url=args.url,
+                model=args.model,
+                response_format=args.response_format,
             )
         )
+
     elif args.mic:
-        asyncio.run(run_mic(args.language, args.url, rotate_soft, rotate_hard))
+        asyncio.run(
+            run_mic(
+                language=args.language,
+                url=args.url,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
+                eof_wait=args.eof_wait,
+            )
+        )
+
     elif args.folder:
         asyncio.run(
             run_folder(
-                args.folder,
-                args.language,
-                args.realtime,
-                args.url,
-                rotate_soft,
-                rotate_hard,
+                folder=args.folder,
+                language=args.language,
+                realtime=args.realtime,
+                url=args.url,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
                 recursive=args.recursive,
                 eof_wait=args.eof_wait,
+                send_speed=args.speed,
+                file_retries=args.file_retries,
             )
         )
+
     else:
         asyncio.run(
             run_file(
-                args.file,
-                args.language,
-                args.realtime,
-                args.url,
-                rotate_soft,
-                rotate_hard,
+                path=args.file,
+                language=args.language,
+                realtime=args.realtime,
+                url=args.url,
+                rotate_soft=rotate_soft,
+                rotate_hard=rotate_hard,
+                save_transcript=False,
                 eof_wait=args.eof_wait,
+                send_speed=args.speed,
+                file_retries=args.file_retries,
             )
         )
 
 
 if __name__ == "__main__":
     main()
-
-
-
-(venv) PS C:\Users\re_nikitav\Documents\asr\nemotron_finetuned> python C:\Users\re_nikitav\Documents\asr\nemotron_finetuned\client_updated.py --folder C:\Users\re_nikitav\Downloads\recordings\recording_wav --language en-US --eof-wait 240
-[info] Server health: {'status': 'ok', 'engines': ['nemotron'], 'device': 'cuda', 'sample_rate': 16000, 'audio_log_dir': '/srv/audio_logs'}
-[info] Found 9 WAV file(s) in C:\Users\re_nikitav\Downloads\recordings\recording_wav
-[info] Each transcript will be saved beside its WAV as <filename>.txt
-
-
-========================================================================
-[info] [1/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
-========================================================================
-[info] File: call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.wav
-[info] Audio: 48000Hz 2ch 16bit 145.2s
-[info] Language: en-US
-[info] Realtime simulation: False
-[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-
-[info] Resampling audio from 48000Hz → 16000Hz
-[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English    [info] File sent — sending EOF and waiting for final results...
-[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language E[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update m[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update m[partial] Hello, thank you for calling in Spirit of Final for this call would you prefer to continue in English or Spanish language English please? Thank you your language preference for this call is set to English. How can I help you today? I would like to update my phone number on my account. I    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
-[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_14783134651_2cLg8k2rfQMZ_b9d809501a0b405aa267280f5baf4240.txt
-[info]
-Done. Audio=145.2s Wall=50.51s RTF=0.35x
-
-========================================================================
-[info] [2/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.wav
-========================================================================
-[info] File: call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.wav
-[info] Audio: 48000Hz 2ch 16bit 133.8s
-[info] Language: en-US
-[info] Realtime simulation: False
-[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-
-[info] Resampling audio from 48000Hz → 16000Hz
-[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-[final]  Well, thank you for calling Inspira Financial for this call. Would you prefer to continue in English or Spanish language  (TTFB 844ms)
-[final]  I.
-[final]  Thank you.  (TTFB 616ms)
-[final]  Your language preference for this call all is set to English. How can I help you today  (TTFB 375ms)
-[info] File sent — sending EOF and waiting for final results...
-[final]  I am calling you because I have not received the verification code on my mobile.  (TTFB 893ms)
-[final]  I understand how frustrating it can be when you're waiting for a code that doesn't arrive. I can help you with that.  (TTFB 591ms)
-[final]  To get started, I'll need to verify your identity.  (TTFB 363ms)
-[final]  Can you please provide your four digit member ID and last four digits of your social security number  (TTFB 301ms)
-[final]  It's two zero four three and one two two three four  (TTFB 815ms)
-[partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset [partial] Okay, let me verify. Thank you for verification. I'm sorry to hear you haven't received your verification code. I'll reset that for you right now. Thought let me reset the alert so you can receive the code. I'm sorry you    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
-[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3exHTq2983sU_cf11e06040de49799466dcd015f6126f.txt
-[info]
-Done. Audio=133.8s Wall=50.53s RTF=0.38x
-
-========================================================================
-[info] [3/9] Processing: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.wav
-========================================================================
-[info] File: call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.wav
-[info] Audio: 48000Hz 2ch 16bit 208.1s
-[info] Language: en-US
-[info] Realtime simulation: False
-[info] Connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-
-[info] Resampling audio from 48000Hz → 16000Hz
-[info] [session 1] connecting to wss://nemotron-3-5-150916788856.us-central1.run.app/asr/realtime-custom-vad
-[final]  Hello, thank you for calling inspira financial for this call. Would you prefer to continue in English or Spanish language  (TTFB 388ms)
-[final]  English.  (TTFB 684ms)
-[final]  Thank you.  (TTFB 498ms)
-[partial] Your language preference for this call is set to English.    [info] File sent — sending EOF and waiting for final results...
-[final]  Your language preference for this call is set to English. How can I help you today?  (TTFB 543ms)
-[final]  I have not received the verification code on my mobile.  (TTFB 625ms)
-[final]  I'm sorry to hear you're having trouble your verification co code. I understand how frustrating that can be.  (TTFB 799ms)
-[final]  I can help you with that.  (TTFB 183ms)
-[partial] To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit di[partial] To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit di[final]  To get started, I all need to verify your identity. Can you please provide your four digit member ID and last four digit digits of your social security number?  (TTFB 423ms)
-[final]  Sure, it's two zero four three and one two three four.  (TTFB 995ms)
-[final]  Okay let me verify.  (TTFB 775ms)
-[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frus[partial] Thank you for verification. I'm sorry to hear you're having trouble receiving your verification code. I understand how frustrating that can be. I'll reset your login code alert now thought, let me reset the alert so you can receive the    [info] [receive] connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
-[info] Transcript saved: C:\Users\re_nikitav\Downloads\recordings\recording_wav\call-_16282607265_3odrcccMWmHd_30a867705e234dc3824620d5c7121792.txt
-[info]
