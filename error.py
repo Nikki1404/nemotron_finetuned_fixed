@@ -48,6 +48,8 @@ import wave
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
+import resampy
 import websockets
 
 #SERVER_URL = "ws://localhost:8002/asr/realtime-custom-vad"
@@ -111,6 +113,25 @@ def http_host_from_ws_url(url: str) -> str:
     return f"{scheme}://{parsed.netloc}"
 
 
+def upsample_if_needed(pcm: bytes, client_sample_rate: int) -> bytes:
+    """
+    Convert mono PCM16 audio from client_sample_rate to SAMPLE_RATE (16 kHz).
+
+    Despite the historical name, this handles both upsampling and downsampling.
+    If the input is already 16 kHz, the original bytes are returned unchanged.
+    """
+    if not pcm or client_sample_rate == SAMPLE_RATE:
+        return pcm
+
+    print_info(f"Resampling audio from {client_sample_rate}Hz → {SAMPLE_RATE}Hz")
+
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    y = resampy.resample(x, client_sample_rate, SAMPLE_RATE)
+    y = np.clip(y, -1.0, 1.0)
+
+    return (y * 32767.0).astype(np.int16).tobytes()
+
+
 # ---------------------------------------------------------------------
 # Shared streaming core (used by both --mic and --file):
 # pulls PCM16 chunks off an asyncio.Queue and sends them over a WebSocket,
@@ -118,7 +139,7 @@ def http_host_from_ws_url(url: str) -> str:
 # reconnecting transparently. Chunks pulled off the queue but not yet
 # successfully sent are requeued so no audio is silently dropped.
 # ---------------------------------------------------------------------
-async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event):
+async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event, final_texts: list[str]):
     """
     Reads server events for one WebSocket leg. Only ever prints a line as
     [final] when the server actually sends a 'final' event — an unconfirmed
@@ -148,6 +169,7 @@ async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event):
                 if text:
                     print_final(text, ttfb)
                     print_corrections(corrections)
+                    final_texts.append(text)
                 got_final.set()
 
             elif ev_type == "done":
@@ -165,7 +187,7 @@ async def _receive_loop(ws, got_final: asyncio.Event, leg_done: asyncio.Event):
         leg_done.set()
 
 
-async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard):
+async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts):
     """
     Runs a single WebSocket connection ("leg") until it's time to rotate,
     the caller asked to stop, or the input source is fully drained.
@@ -182,7 +204,7 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
 
         got_final = asyncio.Event()
         leg_done = asyncio.Event()
-        recv_task = asyncio.create_task(_receive_loop(ws, got_final, leg_done))
+        recv_task = asyncio.create_task(_receive_loop(ws, got_final, leg_done, final_texts))
 
         leg_start = time.time()
         input_finished = False
@@ -250,15 +272,17 @@ async def _run_one_leg(url, language, queue, stop_all_event, session_num, rotate
         return input_finished
 
 
-async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard):
+async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard, final_texts=None):
     session_num = 0
     input_finished = False
+    if final_texts is None:
+        final_texts = []
 
     while not stop_all_event.is_set() and not input_finished:
         session_num += 1
         try:
             input_finished = await _run_one_leg(
-                url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard
+                url, language, queue, stop_all_event, session_num, rotate_soft, rotate_hard, final_texts
             )
         except (websockets.exceptions.ConnectionClosed, OSError) as e:
             print_info(f"[session {session_num}] connection dropped ({e}) — reconnecting")
@@ -268,19 +292,38 @@ async def stream_forever(url, language, queue, stop_all_event, rotate_soft, rota
 # ---------------------------------------------------------------------
 # File mode
 # ---------------------------------------------------------------------
-async def run_file(path: str, language: str, realtime: bool, url: str, rotate_soft: int, rotate_hard: int):
+async def run_file(
+    path: str,
+    language: str,
+    realtime: bool,
+    url: str,
+    rotate_soft: int,
+    rotate_hard: int,
+    save_transcript: bool = False,
+):
     wav_path = Path(path)
 
     if not wav_path.exists():
         print(f"File not found: {path}")
-        sys.exit(1)
+        return None
 
-    with wave.open(str(wav_path), "rb") as wf:
-        n_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        file_sr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw_audio = wf.readframes(n_frames)
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            file_sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw_audio = wf.readframes(n_frames)
+    except (wave.Error, EOFError) as e:
+        print(f"[error] Could not read WAV file {wav_path}: {e}")
+        return None
+
+    if sample_width != 2:
+        print(
+            f"[error] {wav_path.name}: expected 16-bit PCM WAV, "
+            f"got {sample_width * 8}-bit audio"
+        )
+        return None
 
     print_info(f"File: {wav_path.name}")
     print_info(
@@ -291,40 +334,37 @@ async def run_file(path: str, language: str, realtime: bool, url: str, rotate_so
     print_info(f"Realtime simulation: {realtime}")
     print_info(f"Connecting to {url}\n")
 
-    import numpy as np
-
     audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
 
-    if n_channels == 2:
-        audio_i16 = audio_i16.reshape(-1, 2).mean(axis=1).astype(np.int16)
+    # Convert any channel count to mono before resampling.
+    if n_channels > 1:
+        if len(audio_i16) % n_channels != 0:
+            print(f"[error] {wav_path.name}: invalid interleaved PCM data")
+            return None
+        audio_i16 = (
+            audio_i16.reshape(-1, n_channels)
+            .astype(np.float32)
+            .mean(axis=1)
+            .clip(-32768, 32767)
+            .astype(np.int16)
+        )
 
-    if file_sr != SAMPLE_RATE:
-        print_info(f"Resampling {file_sr}Hz → {SAMPLE_RATE}Hz")
-
-        try:
-            import resampy
-        except ImportError:
-            print("resampy not installed. Run: pip install resampy")
-            sys.exit(1)
-
-        audio_f32 = audio_i16.astype(np.float32) / 32768.0
-        audio_f32 = resampy.resample(audio_f32, file_sr, SAMPLE_RATE)
-        audio_i16 = (np.clip(audio_f32, -1.0, 1.0) * 32767).astype(np.int16)
-
-    raw_bytes = audio_i16.tobytes()
-    chunk_samples = int(SAMPLE_RATE * CHUNK_MS / 1000)
-    chunk_bytes = chunk_samples * 2
+    # Centralized sample-rate conversion to 16 kHz.
+    raw_bytes = upsample_if_needed(audio_i16.tobytes(), file_sr)
+    audio_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
 
     chunks = [
-        raw_bytes[i:i + chunk_bytes]
-        for i in range(0, len(raw_bytes), chunk_bytes)
+        raw_bytes[i:i + CHUNK_BYTES]
+        for i in range(0, len(raw_bytes), CHUNK_BYTES)
     ]
 
     queue: asyncio.Queue = asyncio.Queue()
     stop_all_event = asyncio.Event()
+    final_texts: list[str] = []
 
     async def producer():
         t_start = time.time()
+
         for i, chunk in enumerate(chunks):
             await queue.put(chunk)
 
@@ -344,7 +384,15 @@ async def run_file(path: str, language: str, realtime: bool, url: str, rotate_so
     prod_task = asyncio.create_task(producer())
 
     try:
-        await stream_forever(url, language, queue, stop_all_event, rotate_soft, rotate_hard)
+        await stream_forever(
+            url,
+            language,
+            queue,
+            stop_all_event,
+            rotate_soft,
+            rotate_hard,
+            final_texts,
+        )
     except KeyboardInterrupt:
         print_info("Interrupted while sending audio")
         stop_all_event.set()
@@ -359,7 +407,86 @@ async def run_file(path: str, language: str, realtime: bool, url: str, rotate_so
     audio_sec = len(audio_i16) / SAMPLE_RATE
     rtf = elapsed / audio_sec if audio_sec > 0 else 0
 
-    print_info(f"\nDone. Audio={audio_sec:.1f}s Wall={elapsed:.2f}s RTF={rtf:.2f}x")
+    transcript = "\n".join(final_texts).strip()
+
+    if save_transcript:
+        transcript_path = wav_path.with_suffix(".txt")
+        transcript_path.write_text(
+            transcript + ("\n" if transcript else ""),
+            encoding="utf-8",
+        )
+        print_info(f"Transcript saved: {transcript_path}")
+
+    print_info(
+        f"\nDone. Audio={audio_sec:.1f}s Wall={elapsed:.2f}s RTF={rtf:.2f}x"
+    )
+
+    return transcript
+
+
+async def run_folder(
+    folder: str,
+    language: str,
+    realtime: bool,
+    url: str,
+    rotate_soft: int,
+    rotate_hard: int,
+    recursive: bool = False,
+):
+    folder_path = Path(folder)
+
+    if not folder_path.exists():
+        print(f"Folder not found: {folder}")
+        return
+
+    if not folder_path.is_dir():
+        print(f"Not a folder: {folder}")
+        return
+
+    pattern = "**/*.wav" if recursive else "*.wav"
+    wav_files = sorted(
+        (p for p in folder_path.glob(pattern) if p.is_file()),
+        key=lambda p: str(p).lower(),
+    )
+
+    if not wav_files:
+        print(f"No WAV files found in: {folder_path}")
+        return
+
+    print_info(f"Found {len(wav_files)} WAV file(s) in {folder_path}")
+    print_info("Each transcript will be saved beside its WAV as <filename>.txt\n")
+
+    succeeded = 0
+    failed = 0
+
+    for index, wav_path in enumerate(wav_files, start=1):
+        print("\n" + "=" * 72)
+        print_info(f"[{index}/{len(wav_files)}] Processing: {wav_path}")
+        print("=" * 72)
+
+        try:
+            transcript = await run_file(
+                str(wav_path),
+                language,
+                realtime,
+                url,
+                rotate_soft,
+                rotate_hard,
+                save_transcript=True,
+            )
+            if transcript is None:
+                failed += 1
+            else:
+                succeeded += 1
+        except Exception as e:
+            failed += 1
+            print(f"[error] Failed to process {wav_path.name}: {e}")
+
+    print("\n" + "=" * 72)
+    print_info(
+        f"Folder complete. Total={len(wav_files)} "
+        f"Succeeded={succeeded} Failed={failed}"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -551,9 +678,11 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--mic", action="store_true", help="Realtime WebSocket streaming from microphone")
     mode.add_argument("--file", metavar="PATH", help="Send a WAV file (WebSocket streaming by default)")
+    mode.add_argument("--folder", metavar="PATH", help="Process all WAV files in a folder and save one transcript per file")
 
     parser.add_argument("--language", default="en-US")
-    parser.add_argument("--realtime", action="store_true", help="[--file only] Pace chunks to simulate realtime playback over the WebSocket")
+    parser.add_argument("--realtime", action="store_true", help="[--file/--folder] Pace chunks to simulate realtime playback over the WebSocket")
+    parser.add_argument("--recursive", action="store_true", help="[--folder only] Also process WAV files in subfolders")
     parser.add_argument("--url", default=SERVER_URL, help="WebSocket URL (wss://.../asr/realtime-custom-vad)")
     parser.add_argument("--health", action="store_true")
 
@@ -595,7 +724,13 @@ def main():
     args = parser.parse_args()
 
     if args.openai and args.mic:
-        parser.error("--openai requires --file (HTTP file upload); it can't be used with --mic")
+        parser.error("--openai requires --file; it can't be used with --mic")
+
+    if args.openai and args.folder:
+        parser.error("--openai currently supports --file only, not --folder")
+
+    if args.recursive and not args.folder:
+        parser.error("--recursive can only be used with --folder")
 
     if args.rotate_after >= args.rotate_hard:
         parser.error("--rotate-after must be less than --rotate-hard")
@@ -617,8 +752,29 @@ def main():
         )
     elif args.mic:
         asyncio.run(run_mic(args.language, args.url, rotate_soft, rotate_hard))
+    elif args.folder:
+        asyncio.run(
+            run_folder(
+                args.folder,
+                args.language,
+                args.realtime,
+                args.url,
+                rotate_soft,
+                rotate_hard,
+                recursive=args.recursive,
+            )
+        )
     else:
-        asyncio.run(run_file(args.file, args.language, args.realtime, args.url, rotate_soft, rotate_hard))
+        asyncio.run(
+            run_file(
+                args.file,
+                args.language,
+                args.realtime,
+                args.url,
+                rotate_soft,
+                rotate_hard,
+            )
+        )
 
 
 if __name__ == "__main__":
