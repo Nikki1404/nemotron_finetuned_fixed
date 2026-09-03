@@ -39,27 +39,16 @@ docker run -d \
 import argparse
 import asyncio
 import json
-import mimetypes
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
-import uuid
 import wave
 from pathlib import Path
-from urllib.parse import urlparse
 
 import numpy as np
 import resampy
 import websockets
 
-
-# ---------------------------------------------------------------------
-# Server / audio configuration
-# ---------------------------------------------------------------------
-
-# SERVER_URL = "ws://localhost:8002/asr/realtime-custom-vad"
 SERVER_URL = (
     "wss://nemotron-3-5-150916788856."
     "us-central1.run.app/asr/realtime-custom-vad"
@@ -69,69 +58,24 @@ SAMPLE_RATE = 16000
 CHUNK_MS = 100
 CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2
 
-# File streaming:
-#   1.0 = realtime
-#   2.0 = twice realtime
-#   4.0 = four times realtime
-#
-# For this streaming ASR endpoint, 2x is a safer batch default than dumping
-# the complete audio as fast as the client can send it.
-DEFAULT_SEND_SPEED = 2.0
-
-# Maximum time to wait for the server's explicit {"type": "done"} after EOF.
-DEFAULT_EOF_WAIT_SEC = 240
-
-# WebSocket rotation safeguard.
-DEFAULT_ROTATE_SOFT_SEC = 180
-DEFAULT_ROTATE_HARD_SEC = 210
-
-RECONNECT_BACKOFF_SEC = 1.5
-
-# Number of complete-file retries if the WebSocket dies before server "done".
-DEFAULT_FILE_RETRIES = 2
-
-EOF_SENTINEL = object()
+# Large-file settings
+DEFAULT_SEGMENT_SEC = 45
+DEFAULT_OVERLAP_SEC = 1
+DEFAULT_SPEED = 1.0
+DEFAULT_EOF_WAIT_SEC = 120
 
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
-MAGENTA = "\033[95m"
 RED = "\033[91m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
-DIM = "\033[2m"
 
 _LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
 
 
-# ---------------------------------------------------------------------
-# Console helpers
-# ---------------------------------------------------------------------
-
 def clean_text(text: str) -> str:
     return _LANG_TAG_RE.sub("", text or "").strip()
-
-
-def print_partial(text: str):
-    sys.stdout.write(f"\r{YELLOW}[partial]{RESET} {text}    ")
-    sys.stdout.flush()
-
-
-def print_final(text: str, ttfb_ms=None):
-    ttfb_str = f"  {DIM}(TTFB {ttfb_ms}ms){RESET}" if ttfb_ms else ""
-    sys.stdout.write(
-        f"\r{GREEN}{BOLD}[final]  {RESET}{GREEN}{text}{RESET}{ttfb_str}\n"
-    )
-    sys.stdout.flush()
-
-
-def print_corrections(corrections):
-    if not corrections:
-        return
-    sys.stdout.write(
-        f"  {MAGENTA}[corrections]{RESET} {DIM}{corrections}{RESET}\n"
-    )
-    sys.stdout.flush()
 
 
 def print_info(msg: str):
@@ -142,249 +86,178 @@ def print_error(msg: str):
     print(f"{RED}[error]{RESET} {msg}")
 
 
-def http_host_from_ws_url(url: str) -> str:
-    parsed = urlparse(url)
-    scheme = "https" if parsed.scheme in ("wss", "https") else "http"
-    return f"{scheme}://{parsed.netloc}"
+def print_partial(text: str):
+    sys.stdout.write(f"\r{YELLOW}[partial]{RESET} {text}    ")
+    sys.stdout.flush()
 
 
-# ---------------------------------------------------------------------
-# Audio normalization
-# ---------------------------------------------------------------------
+def print_final(text: str):
+    sys.stdout.write(f"\r{GREEN}{BOLD}[final]{RESET} {GREEN}{text}{RESET}\n")
+    sys.stdout.flush()
+
 
 def upsample_if_needed(pcm: bytes, client_sample_rate: int) -> bytes:
     """
-    Resample mono PCM16 audio to SAMPLE_RATE (16 kHz).
-
-    Despite the historical function name, this performs both upsampling
-    and downsampling:
-        8 kHz  -> 16 kHz
-        48 kHz -> 16 kHz
-        16 kHz -> unchanged
+    Resample mono PCM16 audio to 16 kHz.
+    Handles both upsampling and downsampling.
     """
     if not pcm or client_sample_rate == SAMPLE_RATE:
         return pcm
 
     print_info(
-        f"Resampling audio from {client_sample_rate}Hz → {SAMPLE_RATE}Hz"
+        f"Resampling audio from {client_sample_rate}Hz -> {SAMPLE_RATE}Hz"
     )
 
     x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
-    y = resampy.resample(
-        x,
-        client_sample_rate,
-        SAMPLE_RATE,
-    )
-
+    y = resampy.resample(x, client_sample_rate, SAMPLE_RATE)
     y = np.clip(y, -1.0, 1.0)
 
     return (y * 32767.0).astype(np.int16).tobytes()
 
 
-def load_wav_as_16k_mono_pcm16(wav_path: Path):
-    """
-    Read a PCM16 WAV, convert multi-channel audio to mono, then resample
-    to 16 kHz PCM16.
+def load_wav_16k_mono(path: Path) -> tuple[bytes, float]:
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        sr = wf.getframerate()
+        frames = wf.getnframes()
+        raw = wf.readframes(frames)
 
-    Returns:
-        raw_bytes, original_sr, n_channels, sample_width, duration_sec
-    """
-    try:
-        with wave.open(str(wav_path), "rb") as wf:
-            n_channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            file_sr = wf.getframerate()
-            n_frames = wf.getnframes()
-            raw_audio = wf.readframes(n_frames)
-    except (wave.Error, EOFError) as e:
-        raise ValueError(f"Could not read WAV file: {e}") from e
-
-    if sample_width != 2:
+    if width != 2:
         raise ValueError(
-            f"Expected 16-bit PCM WAV, got {sample_width * 8}-bit audio"
+            f"{path.name}: only 16-bit PCM WAV is supported; got {width * 8}-bit"
         )
 
-    if file_sr <= 0:
-        raise ValueError(f"Invalid sample rate: {file_sr}")
+    audio = np.frombuffer(raw, dtype=np.int16)
 
-    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
+    if channels > 1:
+        if len(audio) % channels != 0:
+            raise ValueError(f"{path.name}: invalid interleaved PCM data")
 
-    if n_channels > 1:
-        if len(audio_i16) % n_channels != 0:
-            raise ValueError("Invalid interleaved PCM channel data")
-
-        audio_i16 = (
-            audio_i16.reshape(-1, n_channels)
+        audio = (
+            audio.reshape(-1, channels)
             .astype(np.float32)
             .mean(axis=1)
             .clip(-32768, 32767)
             .astype(np.int16)
         )
 
-    raw_bytes = upsample_if_needed(
-        audio_i16.tobytes(),
-        file_sr,
+    raw_16k = upsample_if_needed(audio.tobytes(), sr)
+    duration = len(raw_16k) / 2 / SAMPLE_RATE
+
+    print_info(
+        f"Audio: {sr}Hz {channels}ch {width * 8}bit "
+        f"{duration:.1f}s -> 16000Hz mono PCM16"
     )
 
-    duration_sec = len(np.frombuffer(raw_bytes, dtype=np.int16)) / SAMPLE_RATE
-
-    return (
-        raw_bytes,
-        file_sr,
-        n_channels,
-        sample_width,
-        duration_sec,
-    )
+    return raw_16k, duration
 
 
-# ---------------------------------------------------------------------
-# WebSocket receive / one connection leg
-# ---------------------------------------------------------------------
-
-async def _receive_loop(
-    ws,
-    got_final: asyncio.Event,
-    server_done: asyncio.Event,
-    final_texts: list[str],
-):
+def split_audio(
+    pcm: bytes,
+    segment_sec: float,
+    overlap_sec: float,
+) -> list[tuple[int, int, bytes]]:
     """
-    Receive ASR events.
-
-    IMPORTANT:
-    server_done is set ONLY when the server explicitly sends:
-        {"type": "done"}
-
-    A dropped WebSocket is NOT considered successful completion.
-    """
-    try:
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                continue
-
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            ev_type = msg.get("type", "")
-            text = clean_text(msg.get("text", ""))
-            ttfb = msg.get("t_start")
-            corrections = msg.get("corrections")
-
-            if ev_type == "partial":
-                if text:
-                    print_partial(text)
-
-            elif ev_type == "final":
-                if text:
-                    print_final(text, ttfb)
-                    print_corrections(corrections)
-                    final_texts.append(text)
-
-                got_final.set()
-
-            elif ev_type == "done":
-                server_done.set()
-                return
-
-            elif ev_type == "error":
-                raise RuntimeError(
-                    text or f"Server returned ASR error: {msg}"
-                )
-
-    except asyncio.CancelledError:
-        raise
-
-    except websockets.exceptions.ConnectionClosed as e:
-        raise ConnectionError(
-            f"WebSocket closed before server completion: {e}"
-        ) from e
-
-
-async def _wait_for_server_done(
-    recv_task: asyncio.Task,
-    server_done: asyncio.Event,
-    eof_wait: int,
-):
-    """
-    Wait for either:
-      1. explicit server "done", or
-      2. receiver failure.
-
-    This avoids waiting the entire EOF timeout after the WebSocket has
-    already died.
-    """
-    done_wait_task = asyncio.create_task(server_done.wait())
-
-    try:
-        finished, _ = await asyncio.wait(
-            {recv_task, done_wait_task},
-            timeout=eof_wait,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if not finished:
-            raise TimeoutError(
-                f"Timed out after {eof_wait}s waiting for server done"
-            )
-
-        if recv_task in finished:
-            # Propagate receiver errors immediately.
-            exc = recv_task.exception()
-
-            if exc is not None:
-                raise exc
-
-            # Receiver exited cleanly but no explicit server "done".
-            if not server_done.is_set():
-                raise ConnectionError(
-                    "Receiver stopped before server sent done"
-                )
-
-        if server_done.is_set():
-            return
-
-        raise ConnectionError(
-            "Server connection ended without a done event"
-        )
-
-    finally:
-        if not done_wait_task.done():
-            done_wait_task.cancel()
-
-        try:
-            await done_wait_task
-        except asyncio.CancelledError:
-            pass
-
-
-async def _run_one_leg(
-    url,
-    language,
-    queue,
-    stop_all_event,
-    session_num,
-    rotate_soft,
-    rotate_hard,
-    final_texts,
-    eof_wait,
-):
-    """
-    Run one WebSocket connection leg.
+    Split 16 kHz mono PCM16 into larger logical segments.
 
     Returns:
-        True  -> input EOF was reached and server confirmed done
-        False -> connection was rotated and more input remains
+        [(start_sample, end_sample, pcm_bytes), ...]
     """
-    print_info(f"[session {session_num}] connecting to {url}")
+    samples = np.frombuffer(pcm, dtype=np.int16)
 
-    # ping_interval=None disables client-side keepalive ping timeouts.
-    #
-    # This is intentional for the batch-file case because the server may
-    # spend a significant amount of time doing inference after receiving
-    # buffered audio. The previous 20s ping timeout was closing otherwise
-    # active ASR sessions before transcription completed.
+    segment_samples = int(segment_sec * SAMPLE_RATE)
+    overlap_samples = int(overlap_sec * SAMPLE_RATE)
+    step_samples = segment_samples - overlap_samples
+
+    if segment_samples <= 0:
+        raise ValueError("--segment-sec must be > 0")
+
+    if overlap_samples < 0:
+        raise ValueError("--overlap-sec cannot be negative")
+
+    if step_samples <= 0:
+        raise ValueError("--overlap-sec must be smaller than --segment-sec")
+
+    segments = []
+
+    start = 0
+
+    while start < len(samples):
+        end = min(start + segment_samples, len(samples))
+        segment = samples[start:end].tobytes()
+
+        segments.append((start, end, segment))
+
+        if end >= len(samples):
+            break
+
+        start += step_samples
+
+    return segments
+
+
+def normalize_word(word: str) -> str:
+    return re.sub(r"[^a-z0-9']", "", word.lower())
+
+
+def merge_transcripts(
+    accumulated: str,
+    new_text: str,
+    max_overlap_words: int = 30,
+) -> str:
+    """
+    Remove exact word overlap caused by overlapped audio segments.
+    """
+    accumulated = accumulated.strip()
+    new_text = new_text.strip()
+
+    if not accumulated:
+        return new_text
+
+    if not new_text:
+        return accumulated
+
+    old_words = accumulated.split()
+    new_words = new_text.split()
+
+    max_n = min(
+        max_overlap_words,
+        len(old_words),
+        len(new_words),
+    )
+
+    for n in range(max_n, 0, -1):
+        left = [normalize_word(w) for w in old_words[-n:]]
+        right = [normalize_word(w) for w in new_words[:n]]
+
+        if left == right:
+            return " ".join(old_words + new_words[n:])
+
+    return accumulated + " " + new_text
+
+
+async def transcribe_segment(
+    pcm: bytes,
+    url: str,
+    language: str,
+    speed: float,
+    eof_wait: int,
+    segment_num: int,
+    total_segments: int,
+) -> str:
+    """
+    Send ONE logical segment through ONE fresh WebSocket.
+
+    The segment itself is still sent in 100 ms binary chunks.
+    """
+    final_texts: list[str] = []
+    server_done = asyncio.Event()
+
+    print_info(
+        f"[segment {segment_num}/{total_segments}] opening fresh WebSocket"
+    )
+
     async with websockets.connect(
         url,
         ping_interval=None,
@@ -402,107 +275,94 @@ async def _run_one_leg(
             )
         )
 
-        got_final = asyncio.Event()
-        server_done = asyncio.Event()
-
-        recv_task = asyncio.create_task(
-            _receive_loop(
-                ws,
-                got_final,
-                server_done,
-                final_texts,
-            )
-        )
-
-        leg_start = time.monotonic()
-        input_finished = False
-        reason = "stopped"
-
-        try:
-            while True:
-                if stop_all_event.is_set():
-                    reason = "stopped"
-                    break
-
-                # Detect receiver failure immediately while we're still sending.
-                if recv_task.done():
-                    exc = recv_task.exception()
-                    if exc is not None:
-                        raise exc
-
-                    if server_done.is_set():
-                        return input_finished
-
-                    raise ConnectionError(
-                        "Receiver stopped before input completed"
-                    )
-
-                elapsed = time.monotonic() - leg_start
-
-                if elapsed >= rotate_hard:
-                    reason = "hard_rotate"
-                    break
-
-                if (
-                    elapsed >= rotate_soft
-                    and got_final.is_set()
-                ):
-                    reason = "soft_rotate"
-                    break
-
-                try:
-                    chunk = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=0.5,
-                    )
-                except asyncio.TimeoutError:
+        async def receiver():
+            async for raw in ws:
+                if isinstance(raw, bytes):
                     continue
 
-                if chunk is EOF_SENTINEL:
-                    input_finished = True
-                    reason = "input_complete"
-                    break
-
                 try:
-                    await ws.send(chunk)
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
 
-                except websockets.exceptions.ConnectionClosed as e:
-                    # Put unsent audio back so a rotated/reconnected leg
-                    # doesn't silently lose this chunk.
-                    await queue.put(chunk)
+                event_type = msg.get("type", "")
+                text = clean_text(msg.get("text", ""))
 
-                    raise ConnectionError(
-                        f"WebSocket closed while sending audio: {e}"
-                    ) from e
+                if event_type == "partial":
+                    if text:
+                        print_partial(text)
 
-            # Tell the server to flush the current leg.
-            try:
-                await ws.send(json.dumps({"type": "eof"}))
-            except websockets.exceptions.ConnectionClosed as e:
+                elif event_type == "final":
+                    if text:
+                        final_texts.append(text)
+                        print_final(text)
+
+                elif event_type == "done":
+                    server_done.set()
+                    return
+
+                elif event_type == "error":
+                    raise RuntimeError(
+                        text or f"Server error: {msg}"
+                    )
+
+            if not server_done.is_set():
                 raise ConnectionError(
-                    f"WebSocket closed while sending EOF: {e}"
-                ) from e
+                    "WebSocket closed before server sent done"
+                )
 
-            # Wait for explicit server "done".
-            await _wait_for_server_done(
-                recv_task,
-                server_done,
-                eof_wait,
+        recv_task = asyncio.create_task(receiver())
+
+        try:
+            chunks = [
+                pcm[i:i + CHUNK_BYTES]
+                for i in range(0, len(pcm), CHUNK_BYTES)
+            ]
+
+            started = time.monotonic()
+
+            for i, chunk in enumerate(chunks):
+                if recv_task.done():
+                    exc = recv_task.exception()
+                    if exc:
+                        raise exc
+                    if not server_done.is_set():
+                        raise ConnectionError(
+                            "Receiver stopped before segment finished"
+                        )
+
+                await ws.send(chunk)
+
+                expected = (
+                    ((i + 1) * CHUNK_MS / 1000.0)
+                    / speed
+                )
+                actual = time.monotonic() - started
+                sleep_for = expected - actual
+
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+
+            await ws.send(json.dumps({"type": "eof"}))
+
+            print_info(
+                f"[segment {segment_num}/{total_segments}] "
+                f"EOF sent; waiting for server done"
             )
 
-            if reason == "soft_rotate":
-                print_info(
-                    f"[session {session_num}] rotating connection "
-                    f"after finalized utterance"
+            try:
+                await asyncio.wait_for(
+                    server_done.wait(),
+                    timeout=eof_wait,
                 )
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    f"segment {segment_num}: no server done within "
+                    f"{eof_wait}s"
+                ) from e
 
-            elif reason == "hard_rotate":
-                print_info(
-                    f"[session {session_num}] force-rotating connection "
-                    f"at safety cutoff"
-                )
-
-            return input_finished
+            # Let receiver exit naturally after done.
+            await recv_task
 
         finally:
             if not recv_task.done():
@@ -513,882 +373,243 @@ async def _run_one_leg(
             except asyncio.CancelledError:
                 pass
             except Exception:
-                # The actual error has already been handled / propagated above.
                 pass
 
-
-async def stream_forever(
-    url,
-    language,
-    queue,
-    stop_all_event,
-    rotate_soft,
-    rotate_hard,
-    final_texts=None,
-    eof_wait=DEFAULT_EOF_WAIT_SEC,
-):
-    """
-    Stream queue contents across one or more WebSocket legs.
-
-    Connection rotation is preserved, but a genuine connection failure is
-    propagated to the caller instead of being mistaken for successful EOF.
-    """
-    if final_texts is None:
-        final_texts = []
-
-    session_num = 0
-    input_finished = False
-
-    while not stop_all_event.is_set() and not input_finished:
-        session_num += 1
-
-        input_finished = await _run_one_leg(
-            url=url,
-            language=language,
-            queue=queue,
-            stop_all_event=stop_all_event,
-            session_num=session_num,
-            rotate_soft=rotate_soft,
-            rotate_hard=rotate_hard,
-            final_texts=final_texts,
-            eof_wait=eof_wait,
-        )
+    return "\n".join(final_texts).strip()
 
 
-# ---------------------------------------------------------------------
-# File mode
-# ---------------------------------------------------------------------
-
-async def _transcribe_file_attempt(
-    raw_bytes: bytes,
-    language: str,
-    realtime: bool,
-    send_speed: float,
+async def transcribe_large_file(
+    wav_path: Path,
     url: str,
-    rotate_soft: int,
-    rotate_hard: int,
+    language: str,
+    segment_sec: float,
+    overlap_sec: float,
+    speed: float,
     eof_wait: int,
-):
-    """
-    One complete transcription attempt.
-
-    Returns the complete list of confirmed final utterances only if the
-    server reaches explicit "done".
-    """
-    chunks = [
-        raw_bytes[i:i + CHUNK_BYTES]
-        for i in range(0, len(raw_bytes), CHUNK_BYTES)
-    ]
-
-    queue: asyncio.Queue = asyncio.Queue()
-    stop_all_event = asyncio.Event()
-    final_texts: list[str] = []
-
-    effective_speed = 1.0 if realtime else send_speed
-
-    async def producer():
-        t_start = time.monotonic()
-
-        for i, chunk in enumerate(chunks):
-            await queue.put(chunk)
-
-            expected_elapsed = (
-                ((i + 1) * CHUNK_MS / 1000.0)
-                / effective_speed
-            )
-
-            actual_elapsed = time.monotonic() - t_start
-            sleep_for = expected_elapsed - actual_elapsed
-
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-
-        print_info(
-            "File sent — sending EOF and waiting for final results..."
-        )
-
-        await queue.put(EOF_SENTINEL)
-
-    prod_task = asyncio.create_task(producer())
-
+    save: bool = True,
+) -> str | None:
     try:
-        await stream_forever(
-            url=url,
-            language=language,
-            queue=queue,
-            stop_all_event=stop_all_event,
-            rotate_soft=rotate_soft,
-            rotate_hard=rotate_hard,
-            final_texts=final_texts,
-            eof_wait=eof_wait,
-        )
-
-        return final_texts
-
-    finally:
-        stop_all_event.set()
-
-        if not prod_task.done():
-            prod_task.cancel()
-
-        try:
-            await prod_task
-        except asyncio.CancelledError:
-            pass
-
-
-async def run_file(
-    path: str,
-    language: str,
-    realtime: bool,
-    url: str,
-    rotate_soft: int,
-    rotate_hard: int,
-    save_transcript: bool = False,
-    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
-    send_speed: float = DEFAULT_SEND_SPEED,
-    file_retries: int = DEFAULT_FILE_RETRIES,
-):
-    wav_path = Path(path)
-
-    if not wav_path.exists():
-        print_error(f"File not found: {path}")
+        pcm, duration = load_wav_16k_mono(wav_path)
+    except Exception as e:
+        print_error(str(e))
         return None
 
-    if not wav_path.is_file():
-        print_error(f"Not a file: {path}")
-        return None
-
-    try:
-        (
-            raw_bytes,
-            file_sr,
-            n_channels,
-            sample_width,
-            audio_sec,
-        ) = load_wav_as_16k_mono_pcm16(wav_path)
-
-    except ValueError as e:
-        print_error(f"{wav_path.name}: {e}")
-        return None
-
-    print_info(f"File: {wav_path.name}")
-    print_info(
-        f"Audio: {file_sr}Hz {n_channels}ch "
-        f"{sample_width * 8}bit {audio_sec:.1f}s"
+    segments = split_audio(
+        pcm,
+        segment_sec=segment_sec,
+        overlap_sec=overlap_sec,
     )
-    print_info(f"Language: {language}")
-    print_info(
-        f"Send speed: {'1.0x realtime' if realtime else f'{send_speed:.2f}x realtime'}"
-    )
-    print_info(f"Connecting to {url}\n")
-
-    total_start = time.monotonic()
-
-    attempts = max(1, file_retries + 1)
-
-    for attempt in range(1, attempts + 1):
-        if attempt > 1:
-            print_info(
-                f"Retrying entire file from the beginning "
-                f"(attempt {attempt}/{attempts})..."
-            )
-
-        try:
-            final_texts = await _transcribe_file_attempt(
-                raw_bytes=raw_bytes,
-                language=language,
-                realtime=realtime,
-                send_speed=send_speed,
-                url=url,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                eof_wait=eof_wait,
-            )
-
-            transcript = "\n".join(final_texts).strip()
-
-            elapsed = time.monotonic() - total_start
-            rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
-
-            if save_transcript:
-                transcript_path = wav_path.with_suffix(".txt")
-
-                transcript_path.write_text(
-                    transcript + ("\n" if transcript else ""),
-                    encoding="utf-8",
-                )
-
-                print_info(
-                    f"Transcript saved: {transcript_path}"
-                )
-
-            print_info(
-                f"\nDone. Audio={audio_sec:.1f}s "
-                f"Wall={elapsed:.2f}s RTF={rtf:.2f}x"
-            )
-
-            return transcript
-
-        except (
-            ConnectionError,
-            TimeoutError,
-            OSError,
-            websockets.exceptions.WebSocketException,
-        ) as e:
-            print_error(
-                f"{wav_path.name}: transcription attempt "
-                f"{attempt}/{attempts} failed: {e}"
-            )
-
-            if attempt < attempts:
-                await asyncio.sleep(RECONNECT_BACKOFF_SEC)
-                continue
-
-            # Never save a normal .txt for an incomplete transcription.
-            print_error(
-                f"{wav_path.name}: server never confirmed complete "
-                f"transcription after {attempts} attempt(s)."
-            )
-
-            return None
-
-
-async def run_folder(
-    folder: str,
-    language: str,
-    realtime: bool,
-    url: str,
-    rotate_soft: int,
-    rotate_hard: int,
-    recursive: bool = False,
-    eof_wait: int = DEFAULT_EOF_WAIT_SEC,
-    send_speed: float = DEFAULT_SEND_SPEED,
-    file_retries: int = DEFAULT_FILE_RETRIES,
-):
-    folder_path = Path(folder)
-
-    if not folder_path.exists():
-        print_error(f"Folder not found: {folder}")
-        return
-
-    if not folder_path.is_dir():
-        print_error(f"Not a folder: {folder}")
-        return
-
-    pattern = "**/*.wav" if recursive else "*.wav"
-
-    wav_files = sorted(
-        (
-            p
-            for p in folder_path.glob(pattern)
-            if p.is_file()
-        ),
-        key=lambda p: str(p).lower(),
-    )
-
-    if not wav_files:
-        print_error(
-            f"No WAV files found in: {folder_path}"
-        )
-        return
 
     print_info(
-        f"Found {len(wav_files)} WAV file(s) in {folder_path}"
-    )
-    print_info(
-        "A .txt file is written only after the server explicitly "
-        "confirms transcription completion.\n"
+        f"{wav_path.name}: {duration:.1f}s -> "
+        f"{len(segments)} segment(s), "
+        f"{segment_sec:.1f}s each, "
+        f"{overlap_sec:.1f}s overlap"
     )
 
-    succeeded = 0
-    failed = 0
+    merged = ""
 
-    for index, wav_path in enumerate(
-        wav_files,
-        start=1,
-    ):
+    for idx, (start, end, segment_pcm) in enumerate(segments, start=1):
+        start_sec = start / SAMPLE_RATE
+        end_sec = end / SAMPLE_RATE
+
         print("\n" + "=" * 72)
         print_info(
-            f"[{index}/{len(wav_files)}] Processing: {wav_path}"
+            f"Segment {idx}/{len(segments)}: "
+            f"{start_sec:.1f}s -> {end_sec:.1f}s"
         )
         print("=" * 72)
 
         try:
-            transcript = await run_file(
-                path=str(wav_path),
-                language=language,
-                realtime=realtime,
+            segment_text = await transcribe_segment(
+                pcm=segment_pcm,
                 url=url,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                save_transcript=True,
+                language=language,
+                speed=speed,
                 eof_wait=eof_wait,
-                send_speed=send_speed,
-                file_retries=file_retries,
+                segment_num=idx,
+                total_segments=len(segments),
             )
-
-            if transcript is None:
-                failed += 1
-            else:
-                succeeded += 1
-
-        except KeyboardInterrupt:
-            raise
 
         except Exception as e:
-            failed += 1
             print_error(
-                f"Unexpected failure processing "
-                f"{wav_path.name}: {e}"
+                f"{wav_path.name}: segment {idx} failed: {e}"
             )
+            print_error(
+                "Final transcript was NOT saved because one segment failed."
+            )
+            return None
+
+        merged = merge_transcripts(
+            merged,
+            segment_text,
+        )
+
+    merged = merged.strip()
+
+    if save:
+        out_path = wav_path.with_suffix(".txt")
+        out_path.write_text(
+            merged + ("\n" if merged else ""),
+            encoding="utf-8",
+        )
+        print_info(f"Transcript saved: {out_path}")
+
+    return merged
+
+
+async def run_folder(args):
+    folder = Path(args.folder)
+
+    if not folder.exists() or not folder.is_dir():
+        print_error(f"Folder not found: {folder}")
+        return
+
+    pattern = "**/*.wav" if args.recursive else "*.wav"
+
+    files = sorted(
+        [p for p in folder.glob(pattern) if p.is_file()],
+        key=lambda p: str(p).lower(),
+    )
+
+    if not files:
+        print_error(f"No WAV files found in {folder}")
+        return
+
+    print_info(f"Found {len(files)} WAV file(s)")
+
+    succeeded = 0
+    failed = 0
+
+    for i, wav_path in enumerate(files, start=1):
+        print("\n" + "#" * 72)
+        print_info(f"[file {i}/{len(files)}] {wav_path}")
+        print("#" * 72)
+
+        result = await transcribe_large_file(
+            wav_path=wav_path,
+            url=args.url,
+            language=args.language,
+            segment_sec=args.segment_sec,
+            overlap_sec=args.overlap_sec,
+            speed=args.speed,
+            eof_wait=args.eof_wait,
+            save=True,
+        )
+
+        if result is None:
+            failed += 1
+        else:
+            succeeded += 1
 
     print("\n" + "=" * 72)
     print_info(
-        f"Folder complete. "
-        f"Total={len(wav_files)} "
-        f"Succeeded={succeeded} "
-        f"Failed={failed}"
+        f"Folder complete. Total={len(files)} "
+        f"Succeeded={succeeded} Failed={failed}"
     )
 
 
-# ---------------------------------------------------------------------
-# Mic mode
-# ---------------------------------------------------------------------
-
-async def run_mic(
-    language: str,
-    url: str,
-    rotate_soft: int,
-    rotate_hard: int,
-    eof_wait: int,
-):
-    try:
-        import sounddevice as sd
-    except ImportError:
-        print(
-            "sounddevice not installed. "
-            "Run: pip install sounddevice"
-        )
-        sys.exit(1)
-
-    print_info(f"Connecting to {url}")
-    print_info(f"Language: {language}")
-    print_info("Speak into your microphone. Press Ctrl+C to stop.\n")
-
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    stop_all_event = asyncio.Event()
-
-    def audio_callback(
-        indata,
-        frames,
-        time_info,
-        status,
-    ):
-        pcm = (
-            indata[:, 0] * 32767
-        ).astype("int16").tobytes()
-
-        loop.call_soon_threadsafe(
-            queue.put_nowait,
-            pcm,
-        )
-
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        blocksize=int(
-            SAMPLE_RATE * CHUNK_MS / 1000
-        ),
-        callback=audio_callback,
-    ):
-        try:
-            await stream_forever(
-                url=url,
-                language=language,
-                queue=queue,
-                stop_all_event=stop_all_event,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                eof_wait=eof_wait,
-            )
-
-        except KeyboardInterrupt:
-            print_info("Stopping...")
-            stop_all_event.set()
-
-
-# ---------------------------------------------------------------------
-# OpenAI-compatible HTTP endpoint
-# ---------------------------------------------------------------------
-
-def _build_multipart_form(
-    fields: dict,
-    file_field: str,
-    file_path: Path,
-):
-    boundary = uuid.uuid4().hex
-    CRLF = "\r\n"
-    body = bytearray()
-
-    for name, value in fields.items():
-        if value is None:
-            continue
-
-        body.extend(
-            f"--{boundary}{CRLF}".encode()
-        )
-
-        body.extend(
-            (
-                f'Content-Disposition: form-data; '
-                f'name="{name}"{CRLF}{CRLF}'
-            ).encode()
-        )
-
-        body.extend(
-            f"{value}{CRLF}".encode()
-        )
-
-    filename = file_path.name
-
-    content_type = (
-        mimetypes.guess_type(filename)[0]
-        or "application/octet-stream"
-    )
-
-    body.extend(
-        f"--{boundary}{CRLF}".encode()
-    )
-
-    body.extend(
-        (
-            f'Content-Disposition: form-data; '
-            f'name="{file_field}"; '
-            f'filename="{filename}"{CRLF}'
-            f"Content-Type: {content_type}{CRLF}{CRLF}"
-        ).encode()
-    )
-
-    with open(file_path, "rb") as f:
-        body.extend(f.read())
-
-    body.extend(CRLF.encode())
-
-    body.extend(
-        f"--{boundary}--{CRLF}".encode()
-    )
-
-    return (
-        bytes(body),
-        f"multipart/form-data; boundary={boundary}",
-    )
-
-
-async def run_openai_http(
-    path: str,
-    language: str,
-    url: str,
-    model: str,
-    response_format: str,
-):
-    wav_path = Path(path)
+async def run_single(args):
+    wav_path = Path(args.file)
 
     if not wav_path.exists():
-        print_error(f"File not found: {path}")
+        print_error(f"File not found: {wav_path}")
         return
 
-    http_host = http_host_from_ws_url(url)
-    endpoint = f"{http_host}/v1/audio/transcriptions"
-
-    print_info(f"File: {wav_path.name}")
-    print_info(f"Language: {language}")
-    print_info(f"Model: {model}")
-    print_info(f"Response format: {response_format}")
-    print_info(f"POST {endpoint}\n")
-
-    body, content_type = _build_multipart_form(
-        fields={
-            "model": model,
-            "language": language,
-            "response_format": response_format,
-        },
-        file_field="file",
-        file_path=wav_path,
+    await transcribe_large_file(
+        wav_path=wav_path,
+        url=args.url,
+        language=args.language,
+        segment_sec=args.segment_sec,
+        overlap_sec=args.overlap_sec,
+        speed=args.speed,
+        eof_wait=args.eof_wait,
+        save=args.save,
     )
 
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        method="POST",
-    )
-
-    req.add_header(
-        "Content-Type",
-        content_type,
-    )
-
-    req.add_header(
-        "Content-Length",
-        str(len(body)),
-    )
-
-    t_start = time.monotonic()
-    loop = asyncio.get_running_loop()
-
-    def _do_request():
-        try:
-            with urllib.request.urlopen(
-                req,
-                timeout=300,
-            ) as resp:
-                return resp.status, resp.read()
-
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-
-        except urllib.error.URLError as e:
-            return None, str(e).encode()
-
-    status, raw_resp = await loop.run_in_executor(
-        None,
-        _do_request,
-    )
-
-    elapsed = time.monotonic() - t_start
-
-    if status is None:
-        print_error(
-            f"Request failed: "
-            f"{raw_resp.decode(errors='replace')}"
-        )
-        return
-
-    if status != 200:
-        print_error(
-            f"HTTP {status}: "
-            f"{raw_resp.decode(errors='replace')}"
-        )
-        return
-
-    if response_format == "text":
-        print_final(
-            raw_resp.decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
-
-    else:
-        try:
-            data = json.loads(raw_resp)
-
-        except json.JSONDecodeError:
-            print_error(
-                "Could not parse JSON response"
-            )
-            return
-
-        print_final(
-            data.get("text", "")
-        )
-
-        if response_format == "verbose_json":
-            print_info(
-                f"duration={data.get('duration')}s "
-                f"language={data.get('language')}"
-            )
-
-    print_info(
-        f"\nDone. Wall={elapsed:.2f}s"
-    )
-
-
-# ---------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------
-
-async def check_health(url: str):
-    try:
-        http_host = http_host_from_ws_url(url)
-
-        with urllib.request.urlopen(
-            f"{http_host}/health",
-            timeout=5,
-        ) as r:
-            data = json.loads(r.read())
-
-        print_info(
-            f"Server health: {data}"
-        )
-
-        return True
-
-    except Exception as e:
-        print(
-            f"[warn] Health check failed: {e} "
-            f"(server may still be starting)"
-        )
-
-        return False
-
-
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Nemotron ASR client "
-            "(WebSocket + OpenAI-compatible HTTP)"
-        )
+        description="Nemotron large-file chunked WebSocket transcription client"
     )
 
-    mode = parser.add_mutually_exclusive_group(
-        required=True
-    )
+    mode = parser.add_mutually_exclusive_group(required=True)
 
-    mode.add_argument(
-        "--mic",
-        action="store_true",
-        help="Realtime WebSocket streaming from microphone",
-    )
-
-    mode.add_argument(
-        "--file",
-        metavar="PATH",
-        help="Send one WAV file",
-    )
-
-    mode.add_argument(
-        "--folder",
-        metavar="PATH",
-        help=(
-            "Process WAV files in a folder and save "
-            "one transcript per WAV"
-        ),
-    )
+    mode.add_argument("--file", metavar="PATH")
+    mode.add_argument("--folder", metavar="PATH")
 
     parser.add_argument(
         "--language",
         default="en-US",
-        help="Language code (default: en-US)",
-    )
-
-    parser.add_argument(
-        "--realtime",
-        action="store_true",
-        help=(
-            "[--file/--folder] send audio at 1x realtime "
-            "instead of --speed"
-        ),
-    )
-
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=DEFAULT_SEND_SPEED,
-        help=(
-            "[--file/--folder] file streaming speed when "
-            f"--realtime is not used (default: {DEFAULT_SEND_SPEED}x)"
-        ),
-    )
-
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help=(
-            "[--folder only] also process WAV files "
-            "inside subfolders"
-        ),
     )
 
     parser.add_argument(
         "--url",
         default=SERVER_URL,
-        help="WebSocket ASR URL",
     )
 
     parser.add_argument(
-        "--health",
-        action="store_true",
-        help="Run health check before transcription",
+        "--segment-sec",
+        type=float,
+        default=DEFAULT_SEGMENT_SEC,
+        help=f"Logical audio segment size (default: {DEFAULT_SEGMENT_SEC}s)",
+    )
+
+    parser.add_argument(
+        "--overlap-sec",
+        type=float,
+        default=DEFAULT_OVERLAP_SEC,
+        help=f"Overlap between logical segments (default: {DEFAULT_OVERLAP_SEC}s)",
+    )
+
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=DEFAULT_SPEED,
+        help=f"Streaming speed; 1.0 = realtime (default: {DEFAULT_SPEED})",
     )
 
     parser.add_argument(
         "--eof-wait",
         type=int,
         default=DEFAULT_EOF_WAIT_SEC,
-        help=(
-            "[--file/--folder] maximum seconds to wait "
-            "for server done after EOF "
-            f"(default: {DEFAULT_EOF_WAIT_SEC})"
-        ),
     )
 
     parser.add_argument(
-        "--file-retries",
-        type=int,
-        default=DEFAULT_FILE_RETRIES,
-        help=(
-            "[--file/--folder] number of complete-file retries "
-            "after premature WebSocket failure "
-            f"(default: {DEFAULT_FILE_RETRIES})"
-        ),
-    )
-
-    parser.add_argument(
-        "--rotate-after",
-        type=int,
-        default=DEFAULT_ROTATE_SOFT_SEC,
-        help=(
-            "seconds before rotating at the next "
-            "finalized utterance"
-        ),
-    )
-
-    parser.add_argument(
-        "--rotate-hard",
-        type=int,
-        default=DEFAULT_ROTATE_HARD_SEC,
-        help="hard WebSocket rotation cutoff",
-    )
-
-    parser.add_argument(
-        "--no-rotate",
+        "--recursive",
         action="store_true",
-        help="disable WebSocket rotation",
     )
 
-    # OpenAI-compatible HTTP mode.
     parser.add_argument(
-        "--openai",
+        "--save",
         action="store_true",
-        help=(
-            "Use /v1/audio/transcriptions instead "
-            "of WebSocket. Requires --file."
-        ),
-    )
-
-    parser.add_argument(
-        "--model",
-        default="nemotron-3.5-asr-streaming-0.6b",
-        help="[--openai only] model id",
-    )
-
-    parser.add_argument(
-        "--response-format",
-        default="json",
-        choices=[
-            "json",
-            "text",
-            "verbose_json",
-        ],
-        help="[--openai only] response format",
+        help="Save .txt for single-file mode",
     )
 
     args = parser.parse_args()
 
+    if args.segment_sec <= 0:
+        parser.error("--segment-sec must be > 0")
+
+    if args.overlap_sec < 0:
+        parser.error("--overlap-sec cannot be negative")
+
+    if args.overlap_sec >= args.segment_sec:
+        parser.error("--overlap-sec must be smaller than --segment-sec")
+
     if args.speed <= 0:
-        parser.error("--speed must be greater than 0")
+        parser.error("--speed must be > 0")
 
     if args.eof_wait <= 0:
-        parser.error("--eof-wait must be greater than 0")
-
-    if args.file_retries < 0:
-        parser.error("--file-retries cannot be negative")
+        parser.error("--eof-wait must be > 0")
 
     if args.recursive and not args.folder:
-        parser.error(
-            "--recursive can only be used with --folder"
-        )
+        parser.error("--recursive can only be used with --folder")
 
-    if args.openai and not args.file:
-        parser.error(
-            "--openai requires --file"
-        )
-
-    if (
-        not args.no_rotate
-        and args.rotate_after >= args.rotate_hard
-    ):
-        parser.error(
-            "--rotate-after must be less than --rotate-hard"
-        )
-
-    rotate_soft = (
-        10**9
-        if args.no_rotate
-        else args.rotate_after
-    )
-
-    rotate_hard = (
-        10**9
-        if args.no_rotate
-        else args.rotate_hard
-    )
-
-    # Keep the existing behavior of checking health before use.
-    asyncio.run(
-        check_health(args.url)
-    )
-
-    if args.openai:
-        asyncio.run(
-            run_openai_http(
-                path=args.file,
-                language=args.language,
-                url=args.url,
-                model=args.model,
-                response_format=args.response_format,
-            )
-        )
-
-    elif args.mic:
-        asyncio.run(
-            run_mic(
-                language=args.language,
-                url=args.url,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                eof_wait=args.eof_wait,
-            )
-        )
-
-    elif args.folder:
-        asyncio.run(
-            run_folder(
-                folder=args.folder,
-                language=args.language,
-                realtime=args.realtime,
-                url=args.url,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                recursive=args.recursive,
-                eof_wait=args.eof_wait,
-                send_speed=args.speed,
-                file_retries=args.file_retries,
-            )
-        )
-
+    if args.folder:
+        asyncio.run(run_folder(args))
     else:
-        asyncio.run(
-            run_file(
-                path=args.file,
-                language=args.language,
-                realtime=args.realtime,
-                url=args.url,
-                rotate_soft=rotate_soft,
-                rotate_hard=rotate_hard,
-                save_transcript=False,
-                eof_wait=args.eof_wait,
-                send_speed=args.speed,
-                file_retries=args.file_retries,
-            )
-        )
+        asyncio.run(run_single(args))
 
 
 if __name__ == "__main__":
